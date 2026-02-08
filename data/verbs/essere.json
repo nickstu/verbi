@@ -1,0 +1,26 @@
+{
+  "infinitive": "essere",
+  "ja": "である",
+  "forms": [
+    {"tense": "presente", "pronoun": "io", "value": "sono"},
+    {"tense": "presente", "pronoun": "tu", "value": "sei"},
+    {"tense": "presente", "pronoun": "lui", "value": "e'"},
+    {"tense": "presente", "pronoun": "lei", "value": "e'"},
+    {"tense": "presente", "pronoun": "noi", "value": "siamo"},
+    {"tense": "presente", "pronoun": "voi", "value": "siete"},
+    {"tense": "presente", "pronoun": "loro", "value": "sono"},
+
+    {"tense": "passato prossimo", "pronoun": "io", "value": "sono stato", "gender": "masculine"},
+    {"tense": "passato prossimo", "pronoun": "io", "value": "sono stata", "gender": "feminine"},
+    {"tense": "passato prossimo", "pronoun": "tu", "value": "sei stato", "gender": "masculine"},
+    {"tense": "passato prossimo", "pronoun": "tu", "value": "sei stata", "gender": "feminine"},
+    {"tense": "passato prossimo", "pronoun": "lui", "value": "e' stato", "gender": "masculine"},
+    {"tense": "passato prossimo", "pronoun": "lei", "value": "e' stata", "gender": "feminine"},
+    {"tense": "passato prossimo", "pronoun": "noi", "value": "siamo stati", "gender": "masculine plural"},
+    {"tense": "passato prossimo", "pronoun": "noi", "value": "siamo state", "gender": "feminine plural"},
+    {"tense": "passato prossimo", "pronoun": "voi", "value": "siete stati", "gender": "masculine plural"},
+    {"tense": "passato prossimo", "pronoun": "voi", "value": "siete state", "gender": "feminine plural"},
+    {"tense": "passato prossimo", "pronoun": "loro", "value": "sono stati", "gender": "masculine plural"},
+    {"tense": "passato prossimo", "pronoun": "loro", "value": "sono state", "gender": "feminine plural"}
+  ]
+}

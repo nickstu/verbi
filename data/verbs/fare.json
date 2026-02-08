@@ -1,0 +1,21 @@
+{
+  "infinitive": "fare",
+  "ja": "する",
+  "forms": [
+    {"tense": "presente", "pronoun": "io", "value": "faccio"},
+    {"tense": "presente", "pronoun": "tu", "value": "fai"},
+    {"tense": "presente", "pronoun": "lui", "value": "fa"},
+    {"tense": "presente", "pronoun": "lei", "value": "fa"},
+    {"tense": "presente", "pronoun": "noi", "value": "facciamo"},
+    {"tense": "presente", "pronoun": "voi", "value": "fate"},
+    {"tense": "presente", "pronoun": "loro", "value": "fanno"},
+
+    {"tense": "passato prossimo", "pronoun": "io", "value": "ho fatto"},
+    {"tense": "passato prossimo", "pronoun": "tu", "value": "hai fatto"},
+    {"tense": "passato prossimo", "pronoun": "lui", "value": "ha fatto"},
+    {"tense": "passato prossimo", "pronoun": "lei", "value": "ha fatto"},
+    {"tense": "passato prossimo", "pronoun": "noi", "value": "abbiamo fatto"},
+    {"tense": "passato prossimo", "pronoun": "voi", "value": "avete fatto"},
+    {"tense": "passato prossimo", "pronoun": "loro", "value": "hanno fatto"}
+  ]
+}

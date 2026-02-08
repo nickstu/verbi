@@ -1,0 +1,26 @@
+{
+  "infinitive": "andare",
+  "ja": "行く",
+  "forms": [
+    {"tense": "presente", "pronoun": "io", "value": "vado"},
+    {"tense": "presente", "pronoun": "tu", "value": "vai"},
+    {"tense": "presente", "pronoun": "lui", "value": "va"},
+    {"tense": "presente", "pronoun": "lei", "value": "va"},
+    {"tense": "presente", "pronoun": "noi", "value": "andiamo"},
+    {"tense": "presente", "pronoun": "voi", "value": "andate"},
+    {"tense": "presente", "pronoun": "loro", "value": "vanno"},
+
+    {"tense": "passato prossimo", "pronoun": "io", "value": "sono andato", "gender": "masculine"},
+    {"tense": "passato prossimo", "pronoun": "io", "value": "sono andata", "gender": "feminine"},
+    {"tense": "passato prossimo", "pronoun": "tu", "value": "sei andato", "gender": "masculine"},
+    {"tense": "passato prossimo", "pronoun": "tu", "value": "sei andata", "gender": "feminine"},
+    {"tense": "passato prossimo", "pronoun": "lui", "value": "e' andato", "gender": "masculine"},
+    {"tense": "passato prossimo", "pronoun": "lei", "value": "e' andata", "gender": "feminine"},
+    {"tense": "passato prossimo", "pronoun": "noi", "value": "siamo andati", "gender": "masculine plural"},
+    {"tense": "passato prossimo", "pronoun": "noi", "value": "siamo andate", "gender": "feminine plural"},
+    {"tense": "passato prossimo", "pronoun": "voi", "value": "siete andati", "gender": "masculine plural"},
+    {"tense": "passato prossimo", "pronoun": "voi", "value": "siete andate", "gender": "feminine plural"},
+    {"tense": "passato prossimo", "pronoun": "loro", "value": "sono andati", "gender": "masculine plural"},
+    {"tense": "passato prossimo", "pronoun": "loro", "value": "sono andate", "gender": "feminine plural"}
+  ]
+}

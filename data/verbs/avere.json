@@ -1,0 +1,21 @@
+{
+  "infinitive": "avere",
+  "ja": "持っている",
+  "forms": [
+    {"tense": "presente", "pronoun": "io", "value": "ho"},
+    {"tense": "presente", "pronoun": "tu", "value": "hai"},
+    {"tense": "presente", "pronoun": "lui", "value": "ha"},
+    {"tense": "presente", "pronoun": "lei", "value": "ha"},
+    {"tense": "presente", "pronoun": "noi", "value": "abbiamo"},
+    {"tense": "presente", "pronoun": "voi", "value": "avete"},
+    {"tense": "presente", "pronoun": "loro", "value": "hanno"},
+
+    {"tense": "passato prossimo", "pronoun": "io", "value": "ho avuto"},
+    {"tense": "passato prossimo", "pronoun": "tu", "value": "hai avuto"},
+    {"tense": "passato prossimo", "pronoun": "lui", "value": "ha avuto"},
+    {"tense": "passato prossimo", "pronoun": "lei", "value": "ha avuto"},
+    {"tense": "passato prossimo", "pronoun": "noi", "value": "abbiamo avuto"},
+    {"tense": "passato prossimo", "pronoun": "voi", "value": "avete avuto"},
+    {"tense": "passato prossimo", "pronoun": "loro", "value": "hanno avuto"}
+  ]
+}
