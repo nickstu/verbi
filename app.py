@@ -339,19 +339,34 @@ def render_page(question, state, finished=False):
           max-height: none;
         }}
         .card-main {{
-          flex-direction: column;
+          flex-direction: row;
+          align-items: flex-start;
+          gap: 16px;
+        }}
+        .card-content {{
+          flex: 1;
         }}
         .card-image {{
-          width: 100%;
-          max-width: 300px;
-          margin: 0 auto;
+          width: 80px;
+          flex-shrink: 0;
+          margin: 0;
         }}
         .answer-form {{
           flex-direction: column;
           align-items: stretch;
+          margin-top: 16px;
         }}
         .pronoun-inline {{
           text-align: center;
+        }}
+        .verb-name {{
+          font-size: 20px;
+        }}
+        .tense {{
+          font-size: 14px;
+        }}
+        .gender {{
+          font-size: 12px;
         }}
       }}
     </style>
