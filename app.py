@@ -16,8 +16,8 @@ TENSE_JA = {
 GENDER_LABELS = {
     "masculine": "maschile 男性",
     "feminine": "femminile 女性",
-    "masculine plural": "maschile plurale 男性複数",
-    "feminine plural": "femminile plurale 女性複数",
+    "masculine plural": "maschile 男性",
+    "feminine plural": "femminile 女性",
 }
 ALL_GENDERS = list(GENDER_LABELS.keys())
 
@@ -347,7 +347,7 @@ def render_page(question, state, finished=False):
           flex: 1;
         }}
         .card-image {{
-          width: 80px;
+          width: 104px;
           flex-shrink: 0;
           margin: 0;
         }}
@@ -405,6 +405,13 @@ def parse_post(environ):
     return {key: values[0] if values else "" for key, values in parsed.items()}
 
 
+def normalize_answer(value):
+    cleaned = value.strip()
+    while cleaned.endswith("."):
+        cleaned = cleaned[:-1].rstrip()
+    return cleaned
+
+
 def serve_static_file(path):
     static_dir = os.path.join(os.path.dirname(__file__), "static")
     file_path = os.path.join(static_dir, path.lstrip("/"))
@@ -454,8 +461,8 @@ def application(environ, start_response):
     if environ.get("REQUEST_METHOD") == "POST":
         form = parse_post(environ)
         state = decode_state(form.get("state", ""))
-        user_answer = form.get("user_answer", "").strip()
-        correct = form.get("q_answer", "").strip()
+        user_answer = normalize_answer(form.get("user_answer", ""))
+        correct = normalize_answer(form.get("q_answer", ""))
         ok = user_answer.lower() == correct.lower()
         entry = {
             "infinitive": form.get("q_infinitive", ""),
