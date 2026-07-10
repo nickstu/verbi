@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+data/users.json
+data/verbi.db
+data/verbi.db-*
