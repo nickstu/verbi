@@ -392,6 +392,12 @@ def load_users():
     return {"users": users}
 
 
+def has_users():
+    init_db()
+    with get_db() as conn:
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0
+
+
 def save_users(data):
     init_db()
     with get_db() as conn:
@@ -619,6 +625,96 @@ def render_login(error=""):
       <div class="actions">
         <button type="submit" name="mode" value="login">ログイン</button>
       </div>
+    </form>
+  </body>
+</html>"""
+
+
+def render_first_admin_setup(error=""):
+    error_html = f'<div class="login-error">{escape(error)}</div>' if error else ""
+    return f"""<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>初期設定</title>
+    <style>
+      body {{
+        min-height: 100vh;
+        margin: 0;
+        display: grid;
+        place-items: center;
+        font-family: Georgia, "Times New Roman", serif;
+        background: #f5f0e6;
+        color: #3d3630;
+      }}
+      .login-window {{
+        width: min(360px, calc(100vw - 40px));
+        background: #fffef9;
+        border: 1px solid #e8e0d4;
+        border-radius: 12px;
+        box-shadow: 0 12px 32px rgba(139, 125, 107, 0.14);
+        padding: 24px;
+      }}
+      h1 {{
+        margin: 0 0 8px;
+        font-size: 22px;
+        color: #4a4239;
+      }}
+      p {{
+        margin: 0 0 16px;
+        color: #6b635c;
+        font-size: 14px;
+        line-height: 1.5;
+      }}
+      label {{
+        display: block;
+        margin: 12px 0 6px;
+        font-size: 13px;
+        color: #6b635c;
+      }}
+      input {{
+        width: 100%;
+        box-sizing: border-box;
+        padding: 10px 12px;
+        font-size: 15px;
+        border: 2px solid #d8d0c4;
+        border-radius: 8px;
+        background: #fffef9;
+      }}
+      button {{
+        width: 100%;
+        margin-top: 18px;
+        background: #8fa68e;
+        color: #fff;
+        border: 0;
+        padding: 11px 12px;
+        border-radius: 8px;
+        font-size: 15px;
+        cursor: pointer;
+      }}
+      .login-error {{
+        margin-bottom: 12px;
+        padding: 10px 12px;
+        border-radius: 8px;
+        background: #f7e7e4;
+        color: #9b4d48;
+        font-size: 13px;
+      }}
+    </style>
+  </head>
+  <body>
+    <form method="post" action="/setup" class="login-window">
+      <h1>初期設定</h1>
+      <p>ユーザーがまだ存在しません。最初の管理者アカウントを作成してください。</p>
+      {error_html}
+      <label for="name">管理者名</label>
+      <input id="name" name="name" type="text" value="admin" autocomplete="username" required />
+      <label for="password">パスワード</label>
+      <input id="password" name="password" type="password" autocomplete="new-password" required />
+      <label for="confirm_password">パスワード確認</label>
+      <input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" required />
+      <button type="submit">管理者を作成</button>
     </form>
   </body>
 </html>"""
@@ -2379,6 +2475,45 @@ def application(environ, start_response):
         headers = [("Content-Type", "text/html; charset=utf-8")]
         clear_session_cookie(headers)
         return redirect(start_response, "/", headers)
+
+    if not has_users():
+        if path == "/setup" and environ.get("REQUEST_METHOD") == "POST":
+            form = parse_post(environ)
+            name = form.get("name", "").strip() or "admin"
+            password = form.get("password", "")
+            confirm_password = form.get("confirm_password", "")
+            if len(password) < 4:
+                body = render_first_admin_setup("4文字以上で入力してください。")
+                start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+                return [body.encode("utf-8")]
+            if password != confirm_password:
+                body = render_first_admin_setup("パスワードが一致しません。")
+                start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+                return [body.encode("utf-8")]
+
+            token = secrets.token_urlsafe(32)
+            save_users(
+                {
+                    "users": {
+                        name: {
+                            "name": name,
+                            "password": password_hash(password),
+                            "elo": DEFAULT_ELO,
+                            "password_reset_required": False,
+                            "state": {"practiced_count": 0},
+                            "session_token": token,
+                            "is_admin": True,
+                        }
+                    }
+                }
+            )
+            headers = []
+            set_session_cookie(headers, token)
+            return redirect(start_response, "/", headers)
+
+        body = render_first_admin_setup()
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [body.encode("utf-8")]
 
     if path == "/login" and environ.get("REQUEST_METHOD") == "POST":
         form = parse_post(environ)
