@@ -131,6 +131,7 @@ def init_db():
                 daily_streak INTEGER NOT NULL DEFAULT 0,
                 daily_last_completed TEXT NOT NULL DEFAULT '',
                 daily_vacation_mode INTEGER NOT NULL DEFAULT 0,
+                daily_state_json TEXT NOT NULL DEFAULT '',
                 session_token TEXT NOT NULL DEFAULT '',
                 password_reset_required INTEGER NOT NULL DEFAULT 0,
                 is_admin INTEGER NOT NULL DEFAULT 0,
@@ -247,6 +248,7 @@ def init_db():
             "daily_streak": "INTEGER NOT NULL DEFAULT 0",
             "daily_last_completed": "TEXT NOT NULL DEFAULT ''",
             "daily_vacation_mode": "INTEGER NOT NULL DEFAULT 0",
+            "daily_state_json": "TEXT NOT NULL DEFAULT ''",
         }
         for column, definition in user_migrations.items():
             if column not in user_columns:
@@ -1646,7 +1648,13 @@ def build_daily_state(user, target=None):
         )
 
     random.shuffle(items)
-    return {"index": 0, "total": len(items), "items": items, "history": []}
+    return {
+        "date": today_key(),
+        "index": 0,
+        "total": len(items),
+        "items": items,
+        "history": [],
+    }
 
 
 def decode_daily_state(value):
@@ -1654,6 +1662,7 @@ def decode_daily_state(value):
         state = json.loads(base64.urlsafe_b64decode(value.encode("ascii")).decode("utf-8"))
         if not isinstance(state.get("items"), list):
             raise ValueError
+        state["date"] = state.get("date", "")
         state["index"] = int(state.get("index", 0))
         state["total"] = int(state.get("total", len(state["items"])))
         state["history"] = list(state.get("history", []))
@@ -1699,6 +1708,67 @@ def complete_daily(username):
     return new_streak
 
 
+def daily_completed_today(user):
+    return user.get("daily_last_completed") == today_key()
+
+
+def load_saved_daily_state(username):
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT daily_state_json FROM users WHERE name = ?",
+            (username,),
+        ).fetchone()
+    if not row or not row["daily_state_json"]:
+        return None
+    state = decode_daily_state(
+        base64.urlsafe_b64encode(row["daily_state_json"].encode("utf-8")).decode("ascii")
+    )
+    if not state or state.get("date") != today_key():
+        clear_saved_daily_state(username)
+        return None
+    if int(state.get("index", 0)) >= int(state.get("total", 0)):
+        clear_saved_daily_state(username)
+        return None
+    return state
+
+
+def save_daily_state(username, state):
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET daily_state_json = ?
+            WHERE name = ?
+            """,
+            (json.dumps(state, ensure_ascii=False), username),
+        )
+
+
+def clear_saved_daily_state(username):
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE users SET daily_state_json = '' WHERE name = ?",
+            (username,),
+        )
+
+
+def daily_progress(username, user):
+    if daily_completed_today(user):
+        return {"status": "completed", "done": int(user.get("daily_target", DEFAULT_DAILY_TARGET)), "total": int(user.get("daily_target", DEFAULT_DAILY_TARGET))}
+    state = load_saved_daily_state(username)
+    if state:
+        return {
+            "status": "in_progress",
+            "done": int(state.get("index", 0)),
+            "total": int(state.get("total", 0)),
+        }
+    return {
+        "status": "not_started",
+        "done": 0,
+        "total": int(user.get("daily_target", DEFAULT_DAILY_TARGET)),
+    }
+
+
 def update_daily_settings(username, target, vacation_mode):
     try:
         target_value = int(target)
@@ -1726,6 +1796,7 @@ def render_nav(username, user, active=""):
         ('href="/verbs"', "動詞練習"),
         ('href="/flashcards"', "単語カード"),
         ('href="/cloze"', "穴埋め"),
+        ('href="/settings"', "設定"),
     ]
     link_html = "".join(
         f'<a {attrs} class="{"active" if label == active else ""}">{label}</a>'
@@ -2203,6 +2274,7 @@ def render_daily(username, user, state, result=None, finished=False, streak=None
         card_html = f"""
           <div class="complete">
             <h1>今日の練習完了</h1>
+            <p>次の日まで待ってください。</p>
             <p>連続記録: {int(streak_value)}日</p>
             <a class="next" href="/">メニューへ</a>
           </div>
@@ -2723,6 +2795,284 @@ def render_menu(username, user):
           <h2>穴埋め</h2>
           <p>イタリア語の文の空欄に入る単語を入力します。下に日本語訳が表示されます。</p>
         </a>
+      </section>
+    </main>
+  </body>
+</html>"""
+
+
+def render_menu(username, user):
+    nav_html = render_nav(username, user, "メニュー")
+    progress = daily_progress(username, user)
+    daily_streak = int(user.get("daily_streak", 0))
+    daily_target = int(user.get("daily_target", DEFAULT_DAILY_TARGET))
+
+    if progress["status"] == "completed":
+        daily_text = "今日の練習は完了しました。次の日まで待ってください。"
+        daily_action = '<span class="start-daily disabled">完了</span>'
+    elif progress["status"] == "in_progress":
+        daily_text = f'途中です: {progress["done"]}/{progress["total"]}問完了'
+        daily_action = '<a class="start-daily" href="/daily">続ける</a>'
+    else:
+        daily_text = f'今日の練習を始めましょう: {daily_target}問'
+        daily_action = '<a class="start-daily" href="/daily">開始</a>'
+
+    return f"""<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>練習メニュー</title>
+    <style>
+      body {{
+        font-family: Georgia, "Times New Roman", serif;
+        background: #f5f0e6;
+        color: #3d3630;
+        margin: 0;
+        padding: 32px;
+      }}
+      .wrap {{
+        max-width: 880px;
+        margin: 0 auto;
+      }}
+      .topline {{
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: center;
+        margin-bottom: 20px;
+      }}
+      .nav {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+      }}
+      .nav a, .logout {{
+        color: #8fa68e;
+        font-size: 13px;
+        font-weight: 600;
+        text-decoration: none;
+      }}
+      .nav a.active {{
+        color: #4a4239;
+      }}
+      .user-status {{
+        color: #7a7065;
+        font-size: 13px;
+        text-align: right;
+      }}
+      h1 {{
+        margin: 0 0 18px;
+        font-size: 28px;
+      }}
+      .daily-panel, .game {{
+        background: #fffef9;
+        border: 1px solid #e8e0d4;
+        border-radius: 12px;
+        box-shadow: 0 12px 32px rgba(139, 125, 107, 0.12);
+        color: inherit;
+        padding: 22px;
+      }}
+      .daily-panel {{
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: center;
+        margin-bottom: 16px;
+      }}
+      .daily-panel h2, .game h2 {{
+        margin: 0 0 8px;
+        font-size: 20px;
+      }}
+      .daily-stats, .game p {{
+        color: #6b635c;
+        font-size: 14px;
+        line-height: 1.5;
+        margin: 0;
+      }}
+      .start-daily {{
+        background: #8fa68e;
+        border-radius: 10px;
+        color: #fff;
+        display: inline-block;
+        font-size: 15px;
+        font-weight: 600;
+        padding: 11px 16px;
+        text-decoration: none;
+        white-space: nowrap;
+      }}
+      .start-daily.disabled {{
+        background: #b8b0a5;
+      }}
+      .games {{
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 16px;
+      }}
+      .game {{
+        display: block;
+        text-decoration: none;
+      }}
+      @media (max-width: 640px) {{
+        body {{
+          padding: 20px;
+        }}
+        .topline, .daily-panel {{
+          align-items: flex-start;
+          flex-direction: column;
+        }}
+        .user-status {{
+          text-align: left;
+        }}
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="wrap">
+      {nav_html}
+      <h1>練習メニュー</h1>
+      <section class="daily-panel">
+        <div>
+          <h2>今日の練習</h2>
+          <p class="daily-stats">{daily_text}</p>
+          <p class="daily-stats">連続記録: {daily_streak}日</p>
+        </div>
+        {daily_action}
+      </section>
+      <section class="games">
+        <a class="game" href="/verbs">
+          <h2>動詞練習</h2>
+          <p>イタリア語の動詞活用を入力して練習します。</p>
+        </a>
+        <a class="game" href="/flashcards">
+          <h2>単語カード</h2>
+          <p>イタリア語の単語を見て、日本語の意味を選びます。</p>
+        </a>
+        <a class="game" href="/cloze">
+          <h2>穴埋め</h2>
+          <p>イタリア語の文の空欄に入る単語を入力します。下に日本語訳が表示されます。</p>
+        </a>
+      </section>
+    </main>
+  </body>
+</html>"""
+
+
+def render_settings(username, user):
+    nav_html = render_nav(username, user, "設定")
+    daily_target = int(user.get("daily_target", DEFAULT_DAILY_TARGET))
+    vacation_checked = "checked" if user.get("daily_vacation_mode") else ""
+    return f"""<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>設定</title>
+    <style>
+      body {{
+        font-family: Georgia, "Times New Roman", serif;
+        background: #f5f0e6;
+        color: #3d3630;
+        margin: 0;
+        padding: 32px;
+      }}
+      .wrap {{
+        max-width: 720px;
+        margin: 0 auto;
+      }}
+      .topline {{
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: center;
+        margin-bottom: 20px;
+      }}
+      .nav {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+      }}
+      .nav a, .logout {{
+        color: #8fa68e;
+        font-size: 13px;
+        font-weight: 600;
+        text-decoration: none;
+      }}
+      .nav a.active {{
+        color: #4a4239;
+      }}
+      .user-status {{
+        color: #7a7065;
+        font-size: 13px;
+        text-align: right;
+      }}
+      .card {{
+        background: #fffef9;
+        border: 1px solid #e8e0d4;
+        border-radius: 12px;
+        box-shadow: 0 12px 32px rgba(139, 125, 107, 0.12);
+        padding: 24px;
+      }}
+      h1 {{
+        margin: 0 0 18px;
+        font-size: 28px;
+      }}
+      label {{
+        display: block;
+        color: #6b635c;
+        font-size: 14px;
+        margin: 0 0 14px;
+      }}
+      input[type="number"] {{
+        display: block;
+        margin-top: 6px;
+        width: 96px;
+        padding: 10px 12px;
+        border: 1px solid #d8d0c4;
+        border-radius: 8px;
+        background: #fffef9;
+        font-size: 16px;
+      }}
+      button {{
+        background: #8fa68e;
+        border: 0;
+        border-radius: 10px;
+        color: #fff;
+        cursor: pointer;
+        font-size: 15px;
+        font-weight: 600;
+        padding: 11px 16px;
+      }}
+      @media (max-width: 640px) {{
+        body {{
+          padding: 20px;
+        }}
+        .topline {{
+          align-items: flex-start;
+          flex-direction: column;
+        }}
+        .user-status {{
+          text-align: left;
+        }}
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="wrap">
+      {nav_html}
+      <section class="card">
+        <h1>設定</h1>
+        <form method="post" action="/settings">
+          <label>
+            今日の練習の問題数
+            <input type="number" name="daily_target" min="3" max="100" value="{daily_target}" />
+          </label>
+          <label>
+            <input type="checkbox" name="daily_vacation_mode" value="1" {vacation_checked} />
+            休暇モード
+          </label>
+          <button type="submit">保存</button>
+        </form>
       </section>
     </main>
   </body>
@@ -3352,6 +3702,19 @@ def application(environ, start_response):
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [body.encode("utf-8")]
 
+    if path == "/settings":
+        if environ.get("REQUEST_METHOD") == "POST":
+            form = parse_post(environ)
+            update_daily_settings(
+                username,
+                form.get("daily_target", DEFAULT_DAILY_TARGET),
+                form.get("daily_vacation_mode") == "1",
+            )
+            return redirect(start_response, "/settings")
+        body = render_settings(username, user)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [body.encode("utf-8")]
+
     if path == "/daily/settings" and environ.get("REQUEST_METHOD") == "POST":
         form = parse_post(environ)
         update_daily_settings(
@@ -3365,6 +3728,10 @@ def application(environ, start_response):
         result = None
         finished = False
         streak = None
+        if daily_completed_today(user):
+            body = render_daily(username, user, {"total": 1, "index": 1, "items": []}, finished=True)
+            start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+            return [body.encode("utf-8")]
         if environ.get("REQUEST_METHOD") == "POST":
             form = parse_post(environ)
             state = decode_daily_state(form.get("state", ""))
@@ -3373,6 +3740,7 @@ def application(environ, start_response):
             index = int(state.get("index", 0))
             if index >= len(state["items"]):
                 streak = complete_daily(username)
+                clear_saved_daily_state(username)
                 user = load_users()["users"].get(username, user)
                 body = render_daily(username, user, state, finished=True, streak=streak)
                 start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
@@ -3417,9 +3785,15 @@ def application(environ, start_response):
             if state["index"] >= len(state["items"]):
                 finished = True
                 streak = complete_daily(username)
+                clear_saved_daily_state(username)
                 user = load_users()["users"].get(username, user)
+            else:
+                save_daily_state(username, state)
         else:
-            state = build_daily_state(user)
+            state = load_saved_daily_state(username)
+            if not state:
+                state = build_daily_state(user)
+                save_daily_state(username, state)
 
         body = render_daily(
             username,
