@@ -7,6 +7,7 @@ import random
 import secrets
 import sqlite3
 import math
+from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from html import escape
 from urllib.parse import parse_qs
@@ -14,11 +15,16 @@ from urllib.parse import parse_qs
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "verbs")
 USERS_PATH = os.path.join(os.path.dirname(__file__), "data", "users.json")
-DB_PATH = os.path.join(os.path.dirname(__file__), "data", "verbi.db")
+DB_PATH = os.environ.get(
+    "VERBI_DB_PATH",
+    os.path.join(os.path.dirname(__file__), "data", "verbi.db"),
+)
 TOTAL_QUESTIONS = 10
+DEFAULT_DAILY_TARGET = 20
 DEFAULT_ELO = 1200
 ELO_K = 32
 NEW_CONTENT_CHANCE = 0.08
+APP_TIMEZONE = timezone(timedelta(hours=9))
 TENSE_JA = {
     "presente": "現在",
     "passato prossimo": "近過去",
@@ -110,7 +116,9 @@ def init_db():
     if DB_INITIALIZED:
         return
 
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     with get_db() as conn:
         conn.executescript(
             """
@@ -119,6 +127,10 @@ def init_db():
                 password_hash TEXT NOT NULL DEFAULT '',
                 practiced_count INTEGER NOT NULL DEFAULT 0,
                 elo INTEGER NOT NULL DEFAULT 1200,
+                daily_target INTEGER NOT NULL DEFAULT 20,
+                daily_streak INTEGER NOT NULL DEFAULT 0,
+                daily_last_completed TEXT NOT NULL DEFAULT '',
+                daily_vacation_mode INTEGER NOT NULL DEFAULT 0,
                 session_token TEXT NOT NULL DEFAULT '',
                 password_reset_required INTEGER NOT NULL DEFAULT 0,
                 is_admin INTEGER NOT NULL DEFAULT 0,
@@ -229,10 +241,16 @@ def init_db():
             row["name"]
             for row in conn.execute("PRAGMA table_info(users)").fetchall()
         }
-        if "elo" not in user_columns:
-            conn.execute(
-                f"ALTER TABLE users ADD COLUMN elo INTEGER NOT NULL DEFAULT {DEFAULT_ELO}"
-            )
+        user_migrations = {
+            "elo": f"INTEGER NOT NULL DEFAULT {DEFAULT_ELO}",
+            "daily_target": f"INTEGER NOT NULL DEFAULT {DEFAULT_DAILY_TARGET}",
+            "daily_streak": "INTEGER NOT NULL DEFAULT 0",
+            "daily_last_completed": "TEXT NOT NULL DEFAULT ''",
+            "daily_vacation_mode": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, definition in user_migrations.items():
+            if column not in user_columns:
+                conn.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
 
         for table in ("questions", "cloze_questions"):
             columns = {
@@ -339,18 +357,26 @@ def init_db():
                             password_hash,
                             practiced_count,
                             elo,
+                            daily_target,
+                            daily_streak,
+                            daily_last_completed,
+                            daily_vacation_mode,
                             session_token,
                             password_reset_required,
                             is_admin,
                             state_json
                         )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         name,
                         user.get("password", ""),
                         int(state.get("practiced_count", 0)),
                         int(user.get("elo", DEFAULT_ELO)),
+                        int(user.get("daily_target", DEFAULT_DAILY_TARGET)),
+                        int(user.get("daily_streak", 0)),
+                        user.get("daily_last_completed", ""),
+                        1 if user.get("daily_vacation_mode") else 0,
                         user.get("session_token", ""),
                         1 if user.get("password_reset_required") else 0,
                         1 if user.get("is_admin") or name == "admin" else 0,
@@ -384,6 +410,10 @@ def load_users():
             "name": row["name"],
             "password": row["password_hash"],
             "elo": int(row["elo"]),
+            "daily_target": int(row["daily_target"]),
+            "daily_streak": int(row["daily_streak"]),
+            "daily_last_completed": row["daily_last_completed"],
+            "daily_vacation_mode": bool(row["daily_vacation_mode"]),
             "state": state,
             "session_token": row["session_token"],
             "password_reset_required": bool(row["password_reset_required"]),
@@ -412,16 +442,24 @@ def save_users(data):
                         password_hash,
                         practiced_count,
                         elo,
+                        daily_target,
+                        daily_streak,
+                        daily_last_completed,
+                        daily_vacation_mode,
                         session_token,
                         password_reset_required,
                         is_admin,
                         state_json
                     )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     password_hash = excluded.password_hash,
                     practiced_count = excluded.practiced_count,
                     elo = excluded.elo,
+                    daily_target = excluded.daily_target,
+                    daily_streak = excluded.daily_streak,
+                    daily_last_completed = excluded.daily_last_completed,
+                    daily_vacation_mode = excluded.daily_vacation_mode,
                     session_token = excluded.session_token,
                     password_reset_required = excluded.password_reset_required,
                     is_admin = excluded.is_admin,
@@ -432,6 +470,10 @@ def save_users(data):
                     user.get("password", ""),
                     practiced,
                     int(user.get("elo", DEFAULT_ELO)),
+                    int(user.get("daily_target", DEFAULT_DAILY_TARGET)),
+                    int(user.get("daily_streak", 0)),
+                    user.get("daily_last_completed", ""),
+                    1 if user.get("daily_vacation_mode") else 0,
                     user.get("session_token", ""),
                     1 if user.get("password_reset_required") else 0,
                     1 if user.get("is_admin") or name == "admin" else 0,
@@ -1537,6 +1579,144 @@ def practiced_count(user):
     return int(user.get("state", {}).get("practiced_count", 0))
 
 
+def today_key():
+    return datetime.now(APP_TIMEZONE).date().isoformat()
+
+
+def distribute_daily_counts(total):
+    games = ["verb_form", "flashcard", "cloze"]
+    base = total // len(games)
+    remainder = total % len(games)
+    return {
+        game: base + (1 if index < remainder else 0)
+        for index, game in enumerate(games)
+    }
+
+
+def build_daily_state(user, target=None):
+    total = max(1, min(100, int(target or user.get("daily_target", DEFAULT_DAILY_TARGET))))
+    counts = distribute_daily_counts(total)
+    items = []
+
+    for _ in range(counts["verb_form"]):
+        question = pick_question(user)
+        items.append(
+            {
+                "game": "verb_form",
+                "question_id": question.get("question_id", ""),
+                "question_elo": int(question.get("question_elo", DEFAULT_ELO)),
+                "is_new": bool(question.get("is_new")),
+                "infinitive": question["infinitive"],
+                "ja": question["ja"],
+                "tense": question["tense"],
+                "pronoun": question["pronoun"],
+                "gender": question.get("gender", ""),
+                "answer": question["answer"],
+            }
+        )
+
+    for _ in range(counts["flashcard"]):
+        card, options = pick_flashcard(user)
+        items.append(
+            {
+                "game": "flashcard",
+                "question_id": card.get("question_id", ""),
+                "question_elo": int(card.get("question_elo", DEFAULT_ELO)),
+                "is_new": bool(card.get("is_new")),
+                "word": card["word"],
+                "translation": card["translation"],
+                "options": options,
+            }
+        )
+
+    for _ in range(counts["cloze"]):
+        question = pick_cloze_question(user)
+        if not question:
+            continue
+        items.append(
+            {
+                "game": "cloze",
+                "question_id": question.get("question_id", ""),
+                "question_elo": int(question.get("question_elo", DEFAULT_ELO)),
+                "is_new": bool(question.get("is_new")),
+                "sentence": question["sentence"],
+                "answer": question["answer"],
+                "translation": question["translation"],
+            }
+        )
+
+    random.shuffle(items)
+    return {"index": 0, "total": len(items), "items": items, "history": []}
+
+
+def decode_daily_state(value):
+    try:
+        state = json.loads(base64.urlsafe_b64decode(value.encode("ascii")).decode("utf-8"))
+        if not isinstance(state.get("items"), list):
+            raise ValueError
+        state["index"] = int(state.get("index", 0))
+        state["total"] = int(state.get("total", len(state["items"])))
+        state["history"] = list(state.get("history", []))
+        return state
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def complete_daily(username):
+    today = today_key()
+    yesterday = (datetime.now(APP_TIMEZONE).date() - timedelta(days=1)).isoformat()
+    with get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT daily_streak, daily_last_completed, daily_vacation_mode
+            FROM users
+            WHERE name = ?
+            """,
+            (username,),
+        ).fetchone()
+        if not row:
+            return None
+
+        previous = row["daily_last_completed"] or ""
+        streak = int(row["daily_streak"])
+        vacation = bool(row["daily_vacation_mode"])
+        if previous == today:
+            new_streak = streak
+        elif previous == yesterday or vacation:
+            new_streak = streak + 1
+        else:
+            new_streak = 1
+
+        conn.execute(
+            """
+            UPDATE users
+            SET daily_streak = ?,
+                daily_last_completed = ?
+            WHERE name = ?
+            """,
+            (new_streak, today, username),
+        )
+    return new_streak
+
+
+def update_daily_settings(username, target, vacation_mode):
+    try:
+        target_value = int(target)
+    except (TypeError, ValueError):
+        target_value = DEFAULT_DAILY_TARGET
+    target_value = max(3, min(100, target_value))
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET daily_target = ?,
+                daily_vacation_mode = ?
+            WHERE name = ?
+            """,
+            (target_value, 1 if vacation_mode else 0, username),
+        )
+
+
 def render_nav(username, user, active=""):
     admin_link = (
         '<a href="/admin">管理</a>' if user.get("is_admin") else ""
@@ -1563,6 +1743,28 @@ def render_nav(username, user, active=""):
     admin_link = '<a href="/admin">管理</a>' if user.get("is_admin") else ""
     links = [
         ('href="/"', "メニュー"),
+        ('href="/verbs"', "動詞練習"),
+        ('href="/flashcards"', "単語カード"),
+        ('href="/cloze"', "穴埋め"),
+    ]
+    link_html = "".join(
+        f'<a {attrs} class="{"active" if label == active else ""}">{label}</a>'
+        for attrs, label in links
+    )
+    return (
+        f'<div class="topline"><nav class="nav">{link_html}{admin_link}</nav>'
+        f'<div class="user-status">{escape(username)} · '
+        f'ELO {int(user.get("elo", DEFAULT_ELO))} · '
+        f'{practiced_count(user)}枚練習済み '
+        '<a class="logout" href="/logout">ログアウト</a></div></div>'
+    )
+
+
+def render_nav(username, user, active=""):
+    admin_link = '<a href="/admin">管理</a>' if user.get("is_admin") else ""
+    links = [
+        ('href="/"', "メニュー"),
+        ('href="/daily"', "今日の練習"),
         ('href="/verbs"', "動詞練習"),
         ('href="/flashcards"', "単語カード"),
         ('href="/cloze"', "穴埋め"),
@@ -1981,6 +2183,255 @@ def render_page(
 </html>"""
 
 
+def render_daily(username, user, state, result=None, finished=False, streak=None):
+    nav_html = render_nav(username, user, "今日の練習")
+    total = max(1, int(state.get("total", 0) or 1))
+    index = min(int(state.get("index", 0)), total)
+    progress = f"{index + 1 if not finished else total}/{total}"
+
+    result_html = ""
+    if result:
+        css_class = "ok" if result["ok"] else "bad"
+        text = "正解です。" if result["ok"] else "不正解です。"
+        result_html = (
+            f'<div class="result {css_class}">{text} '
+            f'答え: {escape(result["answer"])}</div>'
+        )
+
+    if finished:
+        streak_value = streak if streak is not None else user.get("daily_streak", 0)
+        card_html = f"""
+          <div class="complete">
+            <h1>今日の練習完了</h1>
+            <p>連続記録: {int(streak_value)}日</p>
+            <a class="next" href="/">メニューへ</a>
+          </div>
+        """
+    else:
+        item = state["items"][index]
+        new_badge = '<span class="new-badge">NEW</span>' if item.get("is_new") else ""
+        hidden_state = escape(encode_state(state))
+        game = item["game"]
+        game_label = {
+            "verb_form": "動詞練習",
+            "flashcard": "単語カード",
+            "cloze": "穴埋め",
+        }.get(game, "練習")
+        elo_line = (
+            f'<div class="meta">あなたのELO: {int(user.get("elo", DEFAULT_ELO))} / '
+            f'問題ELO: {int(item.get("question_elo", DEFAULT_ELO))}</div>'
+        )
+
+        if game == "verb_form":
+            tense_label = escape(build_tense_label(item["tense"]))
+            gender_label = escape(build_gender_label(item.get("gender", "")))
+            gender_html = f'<div class="meta">{gender_label}</div>' if gender_label else ""
+            card_html = f"""
+              <div class="kicker">{game_label}</div>
+              <div class="word">{escape(item["infinitive"])} {escape(item["ja"])} {new_badge}</div>
+              <div class="meta">{tense_label}</div>
+              {gender_html}
+              {elo_line}
+              <form method="post" action="/daily" class="answer-form">
+                <span class="pronoun-inline">{escape(item["pronoun"])}</span>
+                <input name="answer" type="text" autocomplete="off" autofocus />
+                <button type="submit">確認</button>
+                <input type="hidden" name="state" value="{hidden_state}" />
+              </form>
+            """
+        elif game == "flashcard":
+            option_buttons = "".join(
+                f'<button type="submit" name="answer" value="{escape(option)}">{escape(option)}</button>'
+                for option in item.get("options", [])
+            )
+            card_html = f"""
+              <div class="kicker">{game_label}</div>
+              <div class="prompt">この単語の意味は？</div>
+              <div class="word">{escape(item["word"])} {new_badge}</div>
+              {elo_line}
+              <form method="post" action="/daily" class="options">
+                <input type="hidden" name="state" value="{hidden_state}" />
+                {option_buttons}
+              </form>
+            """
+        else:
+            card_html = f"""
+              <div class="kicker">{game_label}</div>
+              <div class="sentence">{escape(item["sentence"])} {new_badge}</div>
+              <div class="translation">{escape(item["translation"])}</div>
+              {elo_line}
+              <form method="post" action="/daily" class="answer-form">
+                <input name="answer" type="text" autocomplete="off" autofocus />
+                <button type="submit">確認</button>
+                <input type="hidden" name="state" value="{hidden_state}" />
+              </form>
+            """
+
+    return f"""<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>今日の練習</title>
+    <style>
+      body {{
+        font-family: Georgia, "Times New Roman", serif;
+        background: #f5f0e6;
+        color: #3d3630;
+        margin: 0;
+        padding: 32px;
+      }}
+      .wrap {{
+        max-width: 760px;
+        margin: 0 auto;
+      }}
+      .topline {{
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: center;
+        margin-bottom: 20px;
+      }}
+      .nav {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+      }}
+      .nav a, .logout, .next {{
+        color: #8fa68e;
+        font-size: 13px;
+        font-weight: 600;
+        text-decoration: none;
+      }}
+      .nav a.active {{
+        color: #4a4239;
+      }}
+      .user-status {{
+        color: #7a7065;
+        font-size: 13px;
+        text-align: right;
+      }}
+      .card {{
+        background: #fffef9;
+        border: 1px solid #e8e0d4;
+        border-radius: 12px;
+        box-shadow: 0 12px 32px rgba(139, 125, 107, 0.12);
+        padding: 28px;
+      }}
+      .progress, .kicker, .prompt, .meta, .translation {{
+        color: #6b635c;
+        font-size: 14px;
+        margin-bottom: 10px;
+      }}
+      .kicker {{
+        color: #8fa68e;
+        font-weight: 700;
+      }}
+      .word, .sentence {{
+        font-size: 34px;
+        font-weight: 600;
+        line-height: 1.3;
+        margin-bottom: 12px;
+      }}
+      .sentence {{
+        font-size: 28px;
+      }}
+      .new-badge {{
+        background: #c4706a;
+        border-radius: 999px;
+        color: #fff;
+        display: inline-block;
+        font-size: 11px;
+        margin-left: 8px;
+        padding: 3px 7px;
+        vertical-align: middle;
+      }}
+      .answer-form {{
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-top: 18px;
+      }}
+      .pronoun-inline {{
+        font-size: 18px;
+        font-weight: 600;
+      }}
+      input {{
+        flex: 1;
+        min-width: 0;
+        padding: 12px 14px;
+        font-size: 16px;
+        border: 2px solid #d8d0c4;
+        border-radius: 8px;
+        background: #fffef9;
+      }}
+      input:focus {{
+        border-color: #8fa68e;
+        outline: none;
+      }}
+      button, .next {{
+        background: #8fa68e;
+        color: #fff;
+        border: 0;
+        border-radius: 10px;
+        cursor: pointer;
+        display: inline-block;
+        font-size: 16px;
+        padding: 12px 18px;
+        text-align: center;
+      }}
+      .options {{
+        display: grid;
+        gap: 10px;
+        margin-top: 18px;
+      }}
+      .result {{
+        border-radius: 10px;
+        font-size: 14px;
+        margin-bottom: 18px;
+        padding: 12px 14px;
+      }}
+      .ok {{
+        background: #e9f1e8;
+        color: #557a53;
+      }}
+      .bad {{
+        background: #f7e7e4;
+        color: #9b4d48;
+      }}
+      .complete h1 {{
+        margin-top: 0;
+      }}
+      @media (max-width: 640px) {{
+        body {{
+          padding: 20px;
+        }}
+        .topline, .answer-form {{
+          align-items: stretch;
+          flex-direction: column;
+        }}
+        .user-status {{
+          text-align: left;
+        }}
+        .word, .sentence {{
+          font-size: 26px;
+        }}
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="wrap">
+      {nav_html}
+      <section class="card">
+        <div class="progress">{progress}</div>
+        {result_html}
+        {card_html}
+      </section>
+    </main>
+  </body>
+</html>"""
+
+
 def render_menu(username, user):
     nav_html = render_nav(username, user, "メニュー")
     return f"""<!doctype html>
@@ -2074,6 +2525,191 @@ def render_menu(username, user):
     <main class="wrap">
       {nav_html}
       <h1>練習メニュー</h1>
+      <section class="games">
+        <a class="game" href="/verbs">
+          <h2>動詞練習</h2>
+          <p>イタリア語の動詞活用を入力して練習します。</p>
+        </a>
+        <a class="game" href="/flashcards">
+          <h2>単語カード</h2>
+          <p>イタリア語の単語を見て、日本語の意味を選びます。</p>
+        </a>
+        <a class="game" href="/cloze">
+          <h2>穴埋め</h2>
+          <p>イタリア語の文の空欄に入る単語を入力します。下に日本語訳が表示されます。</p>
+        </a>
+      </section>
+    </main>
+  </body>
+</html>"""
+
+
+def render_menu(username, user):
+    nav_html = render_nav(username, user, "メニュー")
+    daily_target = int(user.get("daily_target", DEFAULT_DAILY_TARGET))
+    daily_streak = int(user.get("daily_streak", 0))
+    vacation_checked = "checked" if user.get("daily_vacation_mode") else ""
+    vacation_text = "有効" if user.get("daily_vacation_mode") else "無効"
+    return f"""<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>練習メニュー</title>
+    <style>
+      body {{
+        font-family: Georgia, "Times New Roman", serif;
+        background: #f5f0e6;
+        color: #3d3630;
+        margin: 0;
+        padding: 32px;
+      }}
+      .wrap {{
+        max-width: 880px;
+        margin: 0 auto;
+      }}
+      .topline {{
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: center;
+        margin-bottom: 20px;
+      }}
+      .nav {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+      }}
+      .nav a, .logout {{
+        color: #8fa68e;
+        font-size: 13px;
+        font-weight: 600;
+        text-decoration: none;
+      }}
+      .nav a.active {{
+        color: #4a4239;
+      }}
+      .user-status {{
+        color: #7a7065;
+        font-size: 13px;
+        text-align: right;
+      }}
+      h1 {{
+        margin: 0 0 18px;
+        font-size: 28px;
+      }}
+      .daily-panel, .game {{
+        background: #fffef9;
+        border: 1px solid #e8e0d4;
+        border-radius: 12px;
+        box-shadow: 0 12px 32px rgba(139, 125, 107, 0.12);
+        color: inherit;
+        padding: 22px;
+      }}
+      .daily-panel {{
+        margin-bottom: 16px;
+      }}
+      .daily-header {{
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: center;
+        margin-bottom: 14px;
+      }}
+      .daily-header h2, .game h2 {{
+        margin: 0 0 8px;
+        font-size: 20px;
+      }}
+      .daily-stats, .game p {{
+        color: #6b635c;
+        font-size: 14px;
+        line-height: 1.5;
+        margin: 0;
+      }}
+      .daily-actions {{
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 12px;
+        align-items: end;
+      }}
+      .settings {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+      }}
+      .settings label {{
+        color: #6b635c;
+        font-size: 13px;
+      }}
+      .settings input[type="number"] {{
+        width: 72px;
+        padding: 8px 10px;
+        border: 1px solid #d8d0c4;
+        border-radius: 8px;
+        background: #fffef9;
+      }}
+      .settings button, .start-daily {{
+        background: #8fa68e;
+        border: 0;
+        border-radius: 10px;
+        color: #fff;
+        cursor: pointer;
+        font-size: 15px;
+        font-weight: 600;
+        padding: 11px 16px;
+        text-decoration: none;
+      }}
+      .games {{
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 16px;
+      }}
+      .game {{
+        display: block;
+        text-decoration: none;
+      }}
+      @media (max-width: 640px) {{
+        body {{
+          padding: 20px;
+        }}
+        .topline, .daily-header {{
+          align-items: flex-start;
+          flex-direction: column;
+        }}
+        .daily-actions {{
+          grid-template-columns: 1fr;
+        }}
+        .user-status {{
+          text-align: left;
+        }}
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="wrap">
+      {nav_html}
+      <h1>練習メニュー</h1>
+      <section class="daily-panel">
+        <div class="daily-header">
+          <div>
+            <h2>今日の練習</h2>
+            <p class="daily-stats">連続記録: {daily_streak}日 · {daily_target}問 · 休暇モード: {vacation_text}</p>
+          </div>
+          <a class="start-daily" href="/daily">開始</a>
+        </div>
+        <form method="post" action="/daily/settings" class="settings">
+          <label>
+            問題数
+            <input type="number" name="daily_target" min="3" max="100" value="{daily_target}" />
+          </label>
+          <label>
+            <input type="checkbox" name="daily_vacation_mode" value="1" {vacation_checked} />
+            休暇モード
+          </label>
+          <button type="submit">保存</button>
+        </form>
+      </section>
       <section class="games">
         <a class="game" href="/verbs">
           <h2>動詞練習</h2>
@@ -2713,6 +3349,86 @@ def application(environ, start_response):
 
     if path in ("", "/"):
         body = render_menu(username, user)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [body.encode("utf-8")]
+
+    if path == "/daily/settings" and environ.get("REQUEST_METHOD") == "POST":
+        form = parse_post(environ)
+        update_daily_settings(
+            username,
+            form.get("daily_target", DEFAULT_DAILY_TARGET),
+            form.get("daily_vacation_mode") == "1",
+        )
+        return redirect(start_response, "/")
+
+    if path == "/daily":
+        result = None
+        finished = False
+        streak = None
+        if environ.get("REQUEST_METHOD") == "POST":
+            form = parse_post(environ)
+            state = decode_daily_state(form.get("state", ""))
+            if not state or not state.get("items"):
+                return redirect(start_response, "/daily")
+            index = int(state.get("index", 0))
+            if index >= len(state["items"]):
+                streak = complete_daily(username)
+                user = load_users()["users"].get(username, user)
+                body = render_daily(username, user, state, finished=True, streak=streak)
+                start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+                return [body.encode("utf-8")]
+
+            item = state["items"][index]
+            raw_answer = form.get("answer", "")
+            if item["game"] == "flashcard":
+                correct_answer = item["translation"]
+                ok = raw_answer == correct_answer
+                game = "flashcard"
+                update_function = update_elo
+            elif item["game"] == "cloze":
+                correct_answer = normalize_answer(item["answer"])
+                ok = normalize_answer(raw_answer).lower() == correct_answer.lower()
+                game = "cloze"
+                update_function = update_cloze_elo
+            else:
+                correct_answer = normalize_answer(item["answer"])
+                ok = normalize_answer(raw_answer).lower() == correct_answer.lower()
+                game = "verb_form"
+                update_function = update_elo
+
+            question_id = item.get("question_id", "")
+            if question_id:
+                if update_function == update_cloze_elo:
+                    update_function(username, int(question_id), ok)
+                else:
+                    update_function(username, int(question_id), ok, game)
+
+            state["history"].append(
+                {
+                    "game": item["game"],
+                    "ok": ok,
+                    "answer": correct_answer,
+                }
+            )
+            state["index"] = index + 1
+            user = increment_practiced_count(username) or user
+            result = {"ok": ok, "answer": correct_answer}
+
+            if state["index"] >= len(state["items"]):
+                finished = True
+                streak = complete_daily(username)
+                user = load_users()["users"].get(username, user)
+        else:
+            state = build_daily_state(user)
+
+        body = render_daily(
+            username,
+            user,
+            state,
+            result=result,
+            finished=finished,
+            streak=streak,
+        )
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [body.encode("utf-8")]
 
