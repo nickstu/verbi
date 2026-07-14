@@ -1587,6 +1587,117 @@ def render_approved_card(card):
     """
 
 
+def compact_field(name, value, width_class=""):
+    return (
+        f'<input class="compact-input {width_class}" '
+        f'name="{escape(name)}" value="{escape(value or "")}" />'
+    )
+
+
+def render_approved_card(card):
+    card_type = card["card_type"]
+    hidden = (
+        f'<input type="hidden" name="card_type" value="{escape(card_type)}" />'
+        f'<input type="hidden" name="id" value="{card["id"]}" />'
+    )
+    new_badge = '<span class="status-new">NEW</span>' if card.get("is_new") else ""
+    meta = (
+        f'<div class="compact-meta">#{card["id"]} '
+        f'{escape(card_label(card_type))} '
+        f'<span>ELO {int(card.get("elo", DEFAULT_ELO))}</span>{new_badge}</div>'
+    )
+    if card_type == "cloze":
+        fields = (
+            compact_field("sentence", card.get("sentence", ""), "wide")
+            + compact_field("answer", card.get("answer", ""), "short")
+            + compact_field("translation", card.get("translation", ""), "medium")
+        )
+    elif card_type == "flashcard":
+        fields = (
+            compact_field("infinitive", card.get("infinitive", ""), "medium")
+            + compact_field("ja", card.get("ja", ""), "medium")
+        )
+    else:
+        fields = (
+            compact_field("infinitive", card.get("infinitive", ""), "medium")
+            + compact_field("ja", card.get("ja", ""), "medium")
+            + compact_field("tense", card.get("tense", ""), "short")
+            + compact_field("pronoun", card.get("pronoun", ""), "short")
+            + compact_field("gender", card.get("gender", ""), "short")
+            + compact_field("answer", card.get("answer", ""), "short")
+        )
+    return f"""
+      <div class="content-item compact-card">
+        {meta}
+        <form method="post" action="/admin/content/edit" class="compact-edit">
+          {hidden}
+          <div class="compact-fields">{fields}</div>
+          <button title="保存" aria-label="保存" type="submit">💾</button>
+        </form>
+        <form method="post" action="/admin/content/reset-elo" class="compact-action">
+          {hidden}
+          <button title="ELOをリセット" aria-label="ELOをリセット" type="submit">↺</button>
+        </form>
+        <form method="post" action="/admin/content/delete" class="compact-action">
+          {hidden}
+          <button class="danger" title="削除" aria-label="削除" type="submit">🗑</button>
+        </form>
+      </div>
+    """
+
+
+def render_approved_card(card):
+    card_type = card["card_type"]
+    hidden = (
+        f'<input type="hidden" name="card_type" value="{escape(card_type)}" />'
+        f'<input type="hidden" name="id" value="{card["id"]}" />'
+    )
+    new_badge = '<span class="status-new">NEW</span>' if card.get("is_new") else ""
+    meta = (
+        f'<div class="compact-meta">#{card["id"]} '
+        f'{escape(card_label(card_type))} '
+        f'<span>ELO {int(card.get("elo", DEFAULT_ELO))}</span>{new_badge}</div>'
+    )
+    if card_type == "cloze":
+        fields = (
+            compact_field("sentence", card.get("sentence", ""), "wide")
+            + compact_field("answer", card.get("answer", ""), "short")
+            + compact_field("translation", card.get("translation", ""), "medium")
+        )
+    elif card_type == "flashcard":
+        fields = (
+            compact_field("infinitive", card.get("infinitive", ""), "medium")
+            + compact_field("ja", card.get("ja", ""), "medium")
+        )
+    else:
+        fields = (
+            compact_field("infinitive", card.get("infinitive", ""), "medium")
+            + compact_field("ja", card.get("ja", ""), "medium")
+            + compact_field("tense", card.get("tense", ""), "short")
+            + compact_field("pronoun", card.get("pronoun", ""), "short")
+            + compact_field("gender", card.get("gender", ""), "short")
+            + compact_field("answer", card.get("answer", ""), "short")
+        )
+    return f"""
+      <div class="content-item compact-card">
+        {meta}
+        <form method="post" action="/admin/content/edit" class="compact-edit">
+          {hidden}
+          <div class="compact-fields">{fields}</div>
+          <button title="Save" aria-label="Save" type="submit">&#128190;</button>
+        </form>
+        <form method="post" action="/admin/content/reset-elo" class="compact-action">
+          {hidden}
+          <button title="Reset ELO" aria-label="Reset ELO" type="submit">&#8634;</button>
+        </form>
+        <form method="post" action="/admin/content/delete" class="compact-action">
+          {hidden}
+          <button class="danger" title="Delete" aria-label="Delete" type="submit">&#128465;</button>
+        </form>
+      </div>
+    """
+
+
 def render_content_admin(items=None, approved_cards=None, message="", error=""):
     items = load_pending_content() if items is None else items
     approved_cards = load_approved_cards() if approved_cards is None else approved_cards
@@ -1649,7 +1760,7 @@ def render_content_admin(items=None, approved_cards=None, message="", error=""):
       }}
       .content-list {{
         display: grid;
-        gap: 12px;
+        gap: 6px;
         max-height: 70vh;
         overflow-y: auto;
         padding-right: 4px;
@@ -1660,10 +1771,49 @@ def render_content_admin(items=None, approved_cards=None, message="", error=""):
         border-radius: 10px;
         padding: 16px;
       }}
+      .compact-card {{
+        align-items: center;
+        display: grid;
+        gap: 6px;
+        grid-template-columns: 150px minmax(0, 1fr) 32px 32px;
+        padding: 7px 8px;
+      }}
       .meta, .empty {{
         color: #7a7065;
         font-size: 13px;
         margin-bottom: 8px;
+      }}
+      .compact-meta {{
+        color: #6b635c;
+        font-size: 12px;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }}
+      .status-new {{
+        background: #c4706a;
+        border-radius: 999px;
+        color: #fff;
+        display: inline-block;
+        font-size: 10px;
+        margin-left: 4px;
+        padding: 2px 5px;
+      }}
+      .compact-edit {{
+        align-items: center;
+        display: grid;
+        gap: 6px;
+        grid-template-columns: minmax(0, 1fr) 32px;
+        margin: 0;
+        min-width: 0;
+      }}
+      .compact-fields {{
+        align-items: center;
+        display: flex;
+        gap: 5px;
+        min-width: 0;
+        overflow-x: auto;
       }}
       .field-grid {{
         display: grid;
@@ -1674,6 +1824,21 @@ def render_content_admin(items=None, approved_cards=None, message="", error=""):
         color: #6b635c;
         display: block;
         font-size: 13px;
+      }}
+      .compact-input {{
+        flex: 1 1 130px;
+        margin-top: 0;
+        min-width: 72px;
+        padding: 6px 7px;
+      }}
+      .compact-input.short {{
+        flex-basis: 84px;
+      }}
+      .compact-input.medium {{
+        flex-basis: 140px;
+      }}
+      .compact-input.wide {{
+        flex-basis: 240px;
       }}
       input {{
         box-sizing: border-box;
@@ -1692,7 +1857,9 @@ def render_content_admin(items=None, approved_cards=None, message="", error=""):
         border-radius: 8px;
         cursor: pointer;
         font-size: 14px;
-        padding: 10px 14px;
+        height: 32px;
+        padding: 0;
+        width: 32px;
       }}
       button.secondary {{
         background: #b8aa97;
@@ -1708,6 +1875,9 @@ def render_content_admin(items=None, approved_cards=None, message="", error=""):
         margin-top: 12px;
       }}
       .actions-row form {{
+        margin: 0;
+      }}
+      .compact-action {{
         margin: 0;
       }}
       .notice {{
@@ -1731,6 +1901,12 @@ def render_content_admin(items=None, approved_cards=None, message="", error=""):
         .top {{
           align-items: flex-start;
           flex-direction: column;
+        }}
+        .compact-card {{
+          grid-template-columns: 1fr 32px 32px;
+        }}
+        .compact-meta {{
+          grid-column: 1 / -1;
         }}
       }}
     </style>
@@ -1939,6 +2115,33 @@ def delete_approved_card(form):
             conn.execute(
                 "UPDATE questions SET active = 0 WHERE id = ?",
                 (card_id,),
+            )
+        else:
+            return False
+    return True
+
+
+def reset_approved_card_elo(form):
+    card_type = form.get("card_type", "")
+    card_id = form.get("id", "")
+    with get_db() as conn:
+        if card_type == "cloze":
+            conn.execute(
+                """
+                UPDATE cloze_questions
+                SET elo = ?, is_new = 1
+                WHERE id = ? AND status = 'approved'
+                """,
+                (DEFAULT_ELO, card_id),
+            )
+        elif card_type in ("flashcard", "verb_form"):
+            conn.execute(
+                """
+                UPDATE questions
+                SET elo = ?, is_new = 1
+                WHERE id = ? AND status = 'approved'
+                """,
+                (DEFAULT_ELO, card_id),
             )
         else:
             return False
@@ -4440,6 +4643,17 @@ def application(environ, start_response):
             body = render_content_admin(message="カードを削除しました。")
         else:
             body = render_content_admin(error="カードを削除できませんでした。")
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [body.encode("utf-8")]
+
+    if path == "/admin/content/reset-elo" and environ.get("REQUEST_METHOD") == "POST":
+        if not user.get("is_admin"):
+            return redirect(start_response, "/")
+        form = parse_post(environ)
+        if reset_approved_card_elo(form):
+            body = render_content_admin(message="ELOをリセットしました。")
+        else:
+            body = render_content_admin(error="ELOをリセットできませんでした。")
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [body.encode("utf-8")]
 
