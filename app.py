@@ -1583,49 +1583,65 @@ def import_unimorph_verb_tense(infinitive, ja, tense):
         for form in forms:
             pronoun = form["pronoun"]
             value = form["value"]
-            form_row = conn.execute(
-                """
-                SELECT id FROM verb_forms
-                WHERE verb_id = ? AND tense = ? AND pronoun = ? AND gender = ''
-                """,
-                (verb_id, tense, pronoun),
-            ).fetchone()
-            if form_row:
-                form_id = form_row["id"]
+            pronouns = [pronoun]
+            if pronoun == "lui/lei":
+                existing_third_person = conn.execute(
+                    """
+                    SELECT pronoun
+                    FROM verb_forms
+                    WHERE verb_id = ?
+                        AND tense = ?
+                        AND gender = ''
+                        AND pronoun IN ('lui', 'lei')
+                    """,
+                    (verb_id, tense),
+                ).fetchall()
+                if existing_third_person:
+                    pronouns = [row["pronoun"] for row in existing_third_person]
+            for target_pronoun in pronouns:
+                form_row = conn.execute(
+                    """
+                    SELECT id FROM verb_forms
+                    WHERE verb_id = ? AND tense = ? AND pronoun = ? AND gender = ''
+                    """,
+                    (verb_id, tense, target_pronoun),
+                ).fetchone()
+                if form_row:
+                    form_id = form_row["id"]
+                    conn.execute(
+                        """
+                        UPDATE verb_forms
+                        SET value = ?, source_id = ?
+                        WHERE id = ?
+                        """,
+                        (value, source_id, form_id),
+                    )
+                else:
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO verb_forms
+                            (verb_id, tense, pronoun, value, gender, source_id)
+                        VALUES (?, ?, ?, ?, '', ?)
+                        """,
+                        (verb_id, tense, target_pronoun, value, source_id),
+                    )
+                    form_id = cursor.lastrowid
+                prompt = f"{infinitive}|{ja}|{tense}|{target_pronoun}|"
                 conn.execute(
                     """
-                    UPDATE verb_forms
-                    SET value = ?, source_id = ?
-                    WHERE id = ?
+                    INSERT INTO questions
+                        (kind, verb_id, verb_form_id, prompt, answer, elo, active, status, is_new, source_id)
+                    VALUES ('verb_form', ?, ?, ?, ?, ?, 1, 'approved', 1, ?)
+                    ON CONFLICT(kind, verb_id, verb_form_id) DO UPDATE SET
+                        prompt = excluded.prompt,
+                        answer = excluded.answer,
+                        active = 1,
+                        status = 'approved',
+                        is_new = 1,
+                        source_id = excluded.source_id
                     """,
-                    (value, source_id, form_id),
+                    (verb_id, form_id, prompt, value, DEFAULT_ELO, source_id),
                 )
-            else:
-                cursor = conn.execute(
-                    """
-                    INSERT INTO verb_forms
-                        (verb_id, tense, pronoun, value, gender, source_id)
-                    VALUES (?, ?, ?, ?, '', ?)
-                    """,
-                    (verb_id, tense, pronoun, value, source_id),
-                )
-                form_id = cursor.lastrowid
-            prompt = f"{infinitive}|{ja}|{tense}|{pronoun}|"
-            conn.execute(
-                """
-                INSERT INTO questions
-                    (kind, verb_id, verb_form_id, prompt, answer, elo, active, status, is_new, source_id)
-                VALUES ('verb_form', ?, ?, ?, ?, ?, 1, 'approved', 1, ?)
-                ON CONFLICT(kind, verb_id, verb_form_id) DO UPDATE SET
-                    prompt = excluded.prompt,
-                    answer = excluded.answer,
-                    active = 1,
-                    status = 'approved',
-                    is_new = 1,
-                    source_id = excluded.source_id
-                """,
-                (verb_id, form_id, prompt, value, DEFAULT_ELO, source_id),
-            )
     return True, f"Imported {infinitive} {tense} from UniMorph."
 
 
@@ -2230,29 +2246,34 @@ def render_verb_trees():
         tense_blocks = []
         for tense, forms in sorted(verb["tenses"].items()):
             ordered = sorted(forms, key=lambda item: slot_order.get(item["pronoun"], 99))
+            tense_hidden = (
+                '<input type="hidden" name="card_type" value="verb_tense" />'
+                f'<input type="hidden" name="verb_id" value="{verb["id"]}" />'
+                f'<input type="hidden" name="tense" value="{escape(tense)}" />'
+            )
             rows = []
             for item in ordered:
                 new_badge = '<span class="status-new">NEW</span>' if item["is_new"] else ""
-                hidden = (
-                    '<input type="hidden" name="card_type" value="verb_form" />'
-                    f'<input type="hidden" name="id" value="{item["question_id"]}" />'
-                )
                 rows.append(
                     '<div class="conj-row">'
                     f'<div class="pronoun-cell">{escape(item["pronoun"])}</div>'
                     f'<div class="form-cell">{escape(item["value"])}</div>'
                     f'<div class="elo-cell">ELO {int(item["elo"])} {new_badge}</div>'
-                    '<form method="post" action="/admin/content/reset-elo" class="mini-action">'
-                    f'{hidden}<button title="Reset ELO" aria-label="Reset ELO" type="submit">&#8634;</button>'
-                    '</form>'
-                    '<form method="post" action="/admin/content/delete" class="mini-action">'
-                    f'{hidden}<button class="danger" title="Delete" aria-label="Delete" type="submit">&#128465;</button>'
-                    '</form>'
                     '</div>'
                 )
             tense_blocks.append(
                 '<div class="tense-block">'
+                '<div class="tense-title-row">'
                 f'<div class="tense-title">{escape(tense)}</div>'
+                '<div class="tense-actions">'
+                '<form method="post" action="/admin/content/reset-elo" class="mini-action">'
+                f'{tense_hidden}<button title="Reset ELO" aria-label="Reset ELO" type="submit">&#8634;</button>'
+                '</form>'
+                '<form method="post" action="/admin/content/delete" class="mini-action">'
+                f'{tense_hidden}<button class="danger" title="Delete" aria-label="Delete" type="submit">&#128465;</button>'
+                '</form>'
+                '</div>'
+                '</div>'
                 f'{"".join(rows)}'
                 '</div>'
             )
@@ -2497,11 +2518,22 @@ def render_content_admin(items=None, approved_cards=None, message="", error="", 
         font-weight: 700;
         margin-bottom: 6px;
       }}
+      .tense-title-row {{
+        align-items: center;
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 6px;
+      }}
+      .tense-actions {{
+        display: flex;
+        gap: 6px;
+      }}
       .conj-row {{
         align-items: center;
         display: grid;
         gap: 8px;
-        grid-template-columns: 84px minmax(120px, 1fr) 120px 32px 32px;
+        grid-template-columns: 84px minmax(120px, 1fr) 120px;
         min-height: 30px;
       }}
       .pronoun-cell {{
@@ -2754,6 +2786,23 @@ def delete_approved_card(form):
                 "UPDATE questions SET active = 0 WHERE id = ?",
                 (card_id,),
             )
+        elif card_type == "verb_tense":
+            conn.execute(
+                """
+                UPDATE questions
+                SET active = 0
+                WHERE id IN (
+                    SELECT q.id
+                    FROM questions q
+                    JOIN verb_forms vf ON vf.id = q.verb_form_id
+                    WHERE q.kind = 'verb_form'
+                        AND q.verb_id = ?
+                        AND vf.tense = ?
+                        AND q.status = 'approved'
+                )
+                """,
+                (form.get("verb_id", ""), form.get("tense", "")),
+            )
         else:
             return False
     return True
@@ -2780,6 +2829,23 @@ def reset_approved_card_elo(form):
                 WHERE id = ? AND status = 'approved'
                 """,
                 (DEFAULT_ELO, card_id),
+            )
+        elif card_type == "verb_tense":
+            conn.execute(
+                """
+                UPDATE questions
+                SET elo = ?, is_new = 1
+                WHERE id IN (
+                    SELECT q.id
+                    FROM questions q
+                    JOIN verb_forms vf ON vf.id = q.verb_form_id
+                    WHERE q.kind = 'verb_form'
+                        AND q.verb_id = ?
+                        AND vf.tense = ?
+                        AND q.status = 'approved'
+                )
+                """,
+                (DEFAULT_ELO, form.get("verb_id", ""), form.get("tense", "")),
             )
         else:
             return False
