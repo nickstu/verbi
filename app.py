@@ -1204,6 +1204,747 @@ def render_content_admin(items, message="", error=""):
 </html>"""
 
 
+def render_admin(users, message="", error=""):
+    message_html = f'<div class="notice ok">{escape(message)}</div>' if message else ""
+    error_html = f'<div class="notice bad">{escape(error)}</div>' if error else ""
+    rows = []
+    for name, user in sorted(users["users"].items()):
+        role = "管理者" if user.get("is_admin") else "ユーザー"
+        reset = "未設定" if user.get("password_reset_required") else "設定済み"
+        disabled = " disabled" if user.get("is_admin") else ""
+        rows.append(
+            "<tr>"
+            f"<td>{escape(name)}</td>"
+            f"<td>{role}</td>"
+            f"<td>{reset}</td>"
+            f'<td><form method="post" action="/admin/reset-password">'
+            f'<input type="hidden" name="name" value="{escape(name)}" />'
+            f"<button type=\"submit\"{disabled}>リセット</button>"
+            "</form></td>"
+            "</tr>"
+        )
+    return f"""<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>管理</title>
+    <style>
+      body {{
+        font-family: Georgia, "Times New Roman", serif;
+        background: #f5f0e6;
+        color: #3d3630;
+        margin: 0;
+        padding: 32px;
+      }}
+      .panel {{
+        max-width: 820px;
+        margin: 0 auto;
+        background: #fffef9;
+        border: 1px solid #e8e0d4;
+        border-radius: 12px;
+        box-shadow: 0 12px 32px rgba(139, 125, 107, 0.12);
+        padding: 24px;
+      }}
+      .top, .admin-actions {{
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 20px;
+      }}
+      h1 {{
+        margin: 0;
+        font-size: 24px;
+      }}
+      a, .admin-button {{
+        color: #8fa68e;
+        font-weight: 600;
+        text-decoration: none;
+      }}
+      .admin-button {{
+        background: #8fa68e;
+        border-radius: 10px;
+        color: #fff;
+        display: inline-block;
+        padding: 11px 16px;
+      }}
+      form.create {{
+        display: flex;
+        gap: 10px;
+        margin: 0 0 20px;
+      }}
+      input {{
+        flex: 1;
+        min-width: 0;
+        padding: 10px 12px;
+        font-size: 15px;
+        border: 2px solid #d8d0c4;
+        border-radius: 8px;
+        background: #fffef9;
+      }}
+      button {{
+        background: #8fa68e;
+        color: #fff;
+        border: 0;
+        padding: 10px 14px;
+        border-radius: 8px;
+        font-size: 14px;
+        cursor: pointer;
+      }}
+      button:disabled {{
+        background: #c9c1b7;
+        cursor: default;
+      }}
+      table {{
+        width: 100%;
+        border-collapse: collapse;
+      }}
+      th, td {{
+        padding: 10px 8px;
+        border-bottom: 1px dashed #dcd4c8;
+        text-align: left;
+        font-size: 14px;
+      }}
+      th {{
+        color: #6b635c;
+      }}
+      td form {{
+        margin: 0;
+      }}
+      .notice {{
+        margin-bottom: 14px;
+        padding: 10px 12px;
+        border-radius: 8px;
+        font-size: 13px;
+      }}
+      .ok {{
+        background: #e9f1e8;
+        color: #557a53;
+      }}
+      .bad {{
+        background: #f7e7e4;
+        color: #9b4d48;
+      }}
+      @media (max-width: 640px) {{
+        body {{
+          padding: 20px;
+        }}
+        .top, .admin-actions, form.create {{
+          align-items: stretch;
+          flex-direction: column;
+        }}
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="panel">
+      <div class="top">
+        <h1>管理</h1>
+        <a href="/">メニューへ戻る</a>
+      </div>
+      <div class="admin-actions">
+        <a class="admin-button" href="/admin/content">カード管理</a>
+      </div>
+      {message_html}
+      {error_html}
+      <form method="post" action="/admin/create-user" class="create">
+        <input name="name" type="text" placeholder="新しいユーザー名" autocomplete="off" required />
+        <button type="submit">ユーザー作成</button>
+      </form>
+      <table>
+        <thead>
+          <tr><th>名前</th><th>権限</th><th>パスワード</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          {"".join(rows)}
+        </tbody>
+      </table>
+    </main>
+  </body>
+</html>"""
+
+
+def load_approved_cards():
+    init_db()
+    cards = []
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                q.id,
+                q.kind,
+                q.answer,
+                q.elo,
+                q.is_new,
+                v.infinitive,
+                v.ja,
+                vf.tense,
+                vf.pronoun,
+                vf.gender
+            FROM questions q
+            JOIN verbs v ON v.id = q.verb_id
+            LEFT JOIN verb_forms vf ON vf.id = q.verb_form_id
+            WHERE q.active = 1 AND q.status = 'approved'
+            ORDER BY q.kind, v.infinitive, q.id
+            LIMIT 500
+            """
+        ).fetchall()
+        for row in rows:
+            cards.append(
+                {
+                    "id": row["id"],
+                    "card_type": row["kind"],
+                    "answer": row["answer"],
+                    "elo": row["elo"],
+                    "is_new": bool(row["is_new"]),
+                    "infinitive": row["infinitive"],
+                    "ja": row["ja"],
+                    "tense": row["tense"] or "",
+                    "pronoun": row["pronoun"] or "",
+                    "gender": row["gender"] or "",
+                }
+            )
+
+        rows = conn.execute(
+            """
+            SELECT id, sentence, answer, translation, elo, is_new
+            FROM cloze_questions
+            WHERE active = 1 AND status = 'approved'
+            ORDER BY id DESC
+            LIMIT 500
+            """
+        ).fetchall()
+        for row in rows:
+            cards.append(
+                {
+                    "id": row["id"],
+                    "card_type": "cloze",
+                    "sentence": row["sentence"],
+                    "answer": row["answer"],
+                    "translation": row["translation"],
+                    "elo": row["elo"],
+                    "is_new": bool(row["is_new"]),
+                }
+            )
+    return cards
+
+
+def card_label(card_type):
+    return {
+        "cloze": "穴埋め",
+        "flashcard": "単語カード",
+        "verb_form": "動詞練習",
+    }.get(card_type, card_type)
+
+
+def pending_summary(item):
+    payload = item["payload"]
+    content_type = item["content_type"]
+    if content_type == "cloze":
+        return [
+            ("文", payload.get("sentence", "")),
+            ("答え", payload.get("answer", "")),
+            ("訳", payload.get("translation", "")),
+        ]
+    if content_type == "flashcard":
+        return [
+            ("単語", payload.get("word") or payload.get("infinitive", "")),
+            ("答え", payload.get("translation") or payload.get("answer") or payload.get("ja", "")),
+        ]
+    if content_type == "verb_form":
+        return [
+            ("動詞", payload.get("infinitive") or payload.get("word", "")),
+            ("訳", payload.get("ja") or payload.get("translation", "")),
+            ("時制", payload.get("tense", "")),
+            ("代名詞", payload.get("pronoun", "")),
+            ("性", payload.get("gender", "")),
+            ("答え", payload.get("answer") or payload.get("value", "")),
+        ]
+    return [(key, value) for key, value in payload.items()]
+
+
+def render_pending_item(item):
+    fields = "".join(
+        f'<div><strong>{escape(str(label))}:</strong> {escape(str(value))}</div>'
+        for label, value in pending_summary(item)
+    )
+    return (
+        '<div class="content-item pending-item">'
+        f'<div class="meta">#{item["id"]} · {escape(card_label(item["content_type"]))} · pending</div>'
+        f"{fields}"
+        '<div class="actions-row">'
+        '<form method="post" action="/admin/content/approve">'
+        f'<input type="hidden" name="id" value="{item["id"]}" />'
+        '<button type="submit">承認</button>'
+        '</form>'
+        '<form method="post" action="/admin/content/reject">'
+        f'<input type="hidden" name="id" value="{item["id"]}" />'
+        '<button class="secondary" type="submit">却下</button>'
+        '</form>'
+        '</div>'
+        '</div>'
+    )
+
+
+def render_approved_card(card):
+    card_type = card["card_type"]
+    hidden = (
+        f'<input type="hidden" name="card_type" value="{escape(card_type)}" />'
+        f'<input type="hidden" name="id" value="{card["id"]}" />'
+    )
+    common = (
+        f'<div class="meta">#{card["id"]} · {escape(card_label(card_type))} · '
+        f'ELO {int(card.get("elo", DEFAULT_ELO))}'
+        f'{" · NEW" if card.get("is_new") else ""}</div>'
+    )
+    if card_type == "cloze":
+        fields = f"""
+          <label>文<input name="sentence" value="{escape(card.get("sentence", ""))}" /></label>
+          <label>答え<input name="answer" value="{escape(card.get("answer", ""))}" /></label>
+          <label>訳<input name="translation" value="{escape(card.get("translation", ""))}" /></label>
+        """
+    elif card_type == "flashcard":
+        fields = f"""
+          <label>単語<input name="infinitive" value="{escape(card.get("infinitive", ""))}" /></label>
+          <label>訳<input name="ja" value="{escape(card.get("ja", ""))}" /></label>
+        """
+    else:
+        fields = f"""
+          <label>動詞<input name="infinitive" value="{escape(card.get("infinitive", ""))}" /></label>
+          <label>訳<input name="ja" value="{escape(card.get("ja", ""))}" /></label>
+          <label>時制<input name="tense" value="{escape(card.get("tense", ""))}" /></label>
+          <label>代名詞<input name="pronoun" value="{escape(card.get("pronoun", ""))}" /></label>
+          <label>性<input name="gender" value="{escape(card.get("gender", ""))}" /></label>
+          <label>答え<input name="answer" value="{escape(card.get("answer", ""))}" /></label>
+        """
+    return f"""
+      <div class="content-item">
+        {common}
+        <form method="post" action="/admin/content/edit" class="edit-card">
+          {hidden}
+          <div class="field-grid">{fields}</div>
+          <div class="actions-row">
+            <button type="submit">編集を保存</button>
+        </form>
+        <form method="post" action="/admin/content/delete" class="delete-card">
+          {hidden}
+          <button class="danger" type="submit">削除</button>
+        </form>
+          </div>
+      </div>
+    """
+
+
+def render_approved_card(card):
+    card_type = card["card_type"]
+    hidden = (
+        f'<input type="hidden" name="card_type" value="{escape(card_type)}" />'
+        f'<input type="hidden" name="id" value="{card["id"]}" />'
+    )
+    common = (
+        f'<div class="meta">#{card["id"]} · {escape(card_label(card_type))} · '
+        f'ELO {int(card.get("elo", DEFAULT_ELO))}'
+        f'{" · NEW" if card.get("is_new") else ""}</div>'
+    )
+    if card_type == "cloze":
+        fields = f"""
+          <label>文<input name="sentence" value="{escape(card.get("sentence", ""))}" /></label>
+          <label>答え<input name="answer" value="{escape(card.get("answer", ""))}" /></label>
+          <label>訳<input name="translation" value="{escape(card.get("translation", ""))}" /></label>
+        """
+    elif card_type == "flashcard":
+        fields = f"""
+          <label>単語<input name="infinitive" value="{escape(card.get("infinitive", ""))}" /></label>
+          <label>訳<input name="ja" value="{escape(card.get("ja", ""))}" /></label>
+        """
+    else:
+        fields = f"""
+          <label>動詞<input name="infinitive" value="{escape(card.get("infinitive", ""))}" /></label>
+          <label>訳<input name="ja" value="{escape(card.get("ja", ""))}" /></label>
+          <label>時制<input name="tense" value="{escape(card.get("tense", ""))}" /></label>
+          <label>代名詞<input name="pronoun" value="{escape(card.get("pronoun", ""))}" /></label>
+          <label>性<input name="gender" value="{escape(card.get("gender", ""))}" /></label>
+          <label>答え<input name="answer" value="{escape(card.get("answer", ""))}" /></label>
+        """
+    return f"""
+      <div class="content-item">
+        {common}
+        <form method="post" action="/admin/content/edit" class="edit-card">
+          {hidden}
+          <div class="field-grid">{fields}</div>
+          <div class="actions-row">
+            <button type="submit">編集を保存</button>
+          </div>
+        </form>
+        <div class="actions-row">
+          <form method="post" action="/admin/content/delete" class="delete-card">
+            {hidden}
+            <button class="danger" type="submit">削除</button>
+          </form>
+        </div>
+      </div>
+    """
+
+
+def render_content_admin(items=None, approved_cards=None, message="", error=""):
+    items = load_pending_content() if items is None else items
+    approved_cards = load_approved_cards() if approved_cards is None else approved_cards
+    message_html = f'<div class="notice ok">{escape(message)}</div>' if message else ""
+    error_html = f'<div class="notice bad">{escape(error)}</div>' if error else ""
+    pending_html = (
+        "".join(render_pending_item(item) for item in items)
+        if items
+        else '<div class="empty">レビュー待ちのカードはありません。</div>'
+    )
+    approved_html = (
+        "".join(render_approved_card(card) for card in approved_cards)
+        if approved_cards
+        else '<div class="empty">承認済みカードはありません。</div>'
+    )
+    return f"""<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>カード管理</title>
+    <style>
+      body {{
+        font-family: Georgia, "Times New Roman", serif;
+        background: #f5f0e6;
+        color: #3d3630;
+        margin: 0;
+        padding: 32px;
+      }}
+      .panel {{
+        max-width: 1120px;
+        margin: 0 auto;
+        background: #fffef9;
+        border: 1px solid #e8e0d4;
+        border-radius: 12px;
+        box-shadow: 0 12px 32px rgba(139, 125, 107, 0.12);
+        padding: 24px;
+      }}
+      .top {{
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 20px;
+      }}
+      h1, h2 {{
+        margin: 0 0 14px;
+      }}
+      h1 {{
+        font-size: 24px;
+      }}
+      h2 {{
+        font-size: 18px;
+        margin-top: 24px;
+      }}
+      a {{
+        color: #8fa68e;
+        font-weight: 600;
+        text-decoration: none;
+      }}
+      .content-list {{
+        display: grid;
+        gap: 12px;
+        max-height: 70vh;
+        overflow-y: auto;
+        padding-right: 4px;
+      }}
+      .content-item {{
+        background: #faf7f0;
+        border: 1px solid #e8e0d4;
+        border-radius: 10px;
+        padding: 16px;
+      }}
+      .meta, .empty {{
+        color: #7a7065;
+        font-size: 13px;
+        margin-bottom: 8px;
+      }}
+      .field-grid {{
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 10px;
+      }}
+      label {{
+        color: #6b635c;
+        display: block;
+        font-size: 13px;
+      }}
+      input {{
+        box-sizing: border-box;
+        width: 100%;
+        padding: 9px 10px;
+        font-size: 14px;
+        border: 1px solid #d8d0c4;
+        border-radius: 8px;
+        background: #fffef9;
+        margin-top: 4px;
+      }}
+      button {{
+        background: #8fa68e;
+        color: #fff;
+        border: 0;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 14px;
+        padding: 10px 14px;
+      }}
+      button.secondary {{
+        background: #b8aa97;
+      }}
+      button.danger {{
+        background: #c4706a;
+      }}
+      .actions-row {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        justify-content: flex-end;
+        margin-top: 12px;
+      }}
+      .actions-row form {{
+        margin: 0;
+      }}
+      .notice {{
+        margin-bottom: 14px;
+        padding: 10px 12px;
+        border-radius: 8px;
+        font-size: 13px;
+      }}
+      .ok {{
+        background: #e9f1e8;
+        color: #557a53;
+      }}
+      .bad {{
+        background: #f7e7e4;
+        color: #9b4d48;
+      }}
+      @media (max-width: 640px) {{
+        body {{
+          padding: 20px;
+        }}
+        .top {{
+          align-items: flex-start;
+          flex-direction: column;
+        }}
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="panel">
+      <div class="top">
+        <h1>カード管理</h1>
+        <a href="/admin">管理へ戻る</a>
+      </div>
+      {message_html}
+      {error_html}
+      <h2>レビュー待ち</h2>
+      <div class="content-list">{pending_html}</div>
+      <h2>承認済みカード</h2>
+      <div class="content-list">{approved_html}</div>
+    </main>
+  </body>
+</html>"""
+
+
+def find_or_create_verb(conn, infinitive, ja):
+    infinitive = infinitive.strip()
+    ja = ja.strip()
+    row = conn.execute(
+        "SELECT id FROM verbs WHERE infinitive = ?",
+        (infinitive,),
+    ).fetchone()
+    if row:
+        if ja:
+            conn.execute("UPDATE verbs SET ja = ? WHERE id = ?", (ja, row["id"]))
+        return row["id"]
+    cursor = conn.execute(
+        "INSERT INTO verbs (infinitive, ja) VALUES (?, ?)",
+        (infinitive, ja),
+    )
+    return cursor.lastrowid
+
+
+def approve_pending_content(conn, row, username):
+    payload = json.loads(row["payload_json"])
+    content_type = row["content_type"]
+    if content_type == "cloze":
+        sentence = payload.get("sentence", "").strip()
+        answer = payload.get("answer", "").strip()
+        translation = payload.get("translation", "").strip()
+        if not sentence or not answer or not translation:
+            return False, "候補の内容が足りません。"
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO cloze_questions
+                (sentence, answer, translation, elo, active, status, is_new)
+            VALUES (?, ?, ?, ?, 1, 'approved', 1)
+            """,
+            (sentence, answer, translation, DEFAULT_ELO),
+        )
+    elif content_type == "flashcard":
+        infinitive = (payload.get("infinitive") or payload.get("word") or "").strip()
+        ja = (payload.get("ja") or payload.get("translation") or payload.get("answer") or "").strip()
+        if not infinitive or not ja:
+            return False, "候補の内容が足りません。"
+        verb_id = find_or_create_verb(conn, infinitive, ja)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO questions
+                (kind, verb_id, verb_form_id, prompt, answer, elo, active, status, is_new)
+            VALUES ('flashcard', ?, NULL, ?, ?, ?, 1, 'approved', 1)
+            """,
+            (verb_id, infinitive, ja, DEFAULT_ELO),
+        )
+    elif content_type == "verb_form":
+        infinitive = (payload.get("infinitive") or payload.get("word") or "").strip()
+        ja = (payload.get("ja") or payload.get("translation") or "").strip()
+        tense = payload.get("tense", "").strip()
+        pronoun = payload.get("pronoun", "").strip()
+        gender = payload.get("gender", "").strip()
+        answer = (payload.get("answer") or payload.get("value") or "").strip()
+        if not infinitive or not ja or not tense or not pronoun or not answer:
+            return False, "候補の内容が足りません。"
+        verb_id = find_or_create_verb(conn, infinitive, ja)
+        form_row = conn.execute(
+            """
+            SELECT id FROM verb_forms
+            WHERE verb_id = ? AND tense = ? AND pronoun = ? AND gender = ?
+            """,
+            (verb_id, tense, pronoun, gender),
+        ).fetchone()
+        if form_row:
+            form_id = form_row["id"]
+            conn.execute(
+                "UPDATE verb_forms SET value = ? WHERE id = ?",
+                (answer, form_id),
+            )
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO verb_forms (verb_id, tense, pronoun, value, gender)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (verb_id, tense, pronoun, answer, gender),
+            )
+            form_id = cursor.lastrowid
+        prompt = f"{infinitive}|{ja}|{tense}|{pronoun}|{gender}"
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO questions
+                (kind, verb_id, verb_form_id, prompt, answer, elo, active, status, is_new)
+            VALUES ('verb_form', ?, ?, ?, ?, ?, 1, 'approved', 1)
+            """,
+            (verb_id, form_id, prompt, answer, DEFAULT_ELO),
+        )
+    else:
+        return False, "未対応の種類です。"
+
+    conn.execute(
+        """
+        UPDATE pending_content
+        SET status = 'approved',
+            reviewed_by = ?,
+            reviewed_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (username, row["id"]),
+    )
+    return True, "承認しました。"
+
+
+def update_approved_card(form):
+    card_type = form.get("card_type", "")
+    card_id = form.get("id", "")
+    with get_db() as conn:
+        if card_type == "cloze":
+            conn.execute(
+                """
+                UPDATE cloze_questions
+                SET sentence = ?, answer = ?, translation = ?
+                WHERE id = ?
+                """,
+                (
+                    form.get("sentence", "").strip(),
+                    form.get("answer", "").strip(),
+                    form.get("translation", "").strip(),
+                    card_id,
+                ),
+            )
+            return True
+
+        row = conn.execute(
+            """
+            SELECT q.id, q.kind, q.verb_id, q.verb_form_id
+            FROM questions q
+            WHERE q.id = ?
+            """,
+            (card_id,),
+        ).fetchone()
+        if not row:
+            return False
+        infinitive = form.get("infinitive", "").strip()
+        ja = form.get("ja", "").strip()
+        conn.execute(
+            "UPDATE verbs SET infinitive = ?, ja = ? WHERE id = ?",
+            (infinitive, ja, row["verb_id"]),
+        )
+        if card_type == "flashcard":
+            conn.execute(
+                """
+                UPDATE questions
+                SET prompt = ?, answer = ?
+                WHERE id = ?
+                """,
+                (infinitive, ja, card_id),
+            )
+        elif card_type == "verb_form":
+            tense = form.get("tense", "").strip()
+            pronoun = form.get("pronoun", "").strip()
+            gender = form.get("gender", "").strip()
+            answer = form.get("answer", "").strip()
+            conn.execute(
+                """
+                UPDATE verb_forms
+                SET tense = ?, pronoun = ?, gender = ?, value = ?
+                WHERE id = ?
+                """,
+                (tense, pronoun, gender, answer, row["verb_form_id"]),
+            )
+            prompt = f"{infinitive}|{ja}|{tense}|{pronoun}|{gender}"
+            conn.execute(
+                "UPDATE questions SET prompt = ?, answer = ? WHERE id = ?",
+                (prompt, answer, card_id),
+            )
+        else:
+            return False
+    return True
+
+
+def delete_approved_card(form):
+    card_type = form.get("card_type", "")
+    card_id = form.get("id", "")
+    with get_db() as conn:
+        if card_type == "cloze":
+            conn.execute(
+                "UPDATE cloze_questions SET active = 0 WHERE id = ?",
+                (card_id,),
+            )
+        elif card_type in ("flashcard", "verb_form"):
+            conn.execute(
+                "UPDATE questions SET active = 0 WHERE id = ?",
+                (card_id,),
+            )
+        else:
+            return False
+    return True
+
+
 def encode_state(state):
     raw = json.dumps(state, ensure_ascii=False).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii")
@@ -3583,6 +4324,34 @@ def application(environ, start_response):
             return redirect(start_response, "/")
         form = parse_post(environ)
         content_id = form.get("id", "")
+        message = ""
+        error = ""
+        with get_db() as conn:
+            row = conn.execute(
+                """
+                SELECT id, content_type, payload_json
+                FROM pending_content
+                WHERE id = ? AND status = 'pending'
+                """,
+                (content_id,),
+            ).fetchone()
+            if not row:
+                error = "候補が見つかりません。"
+            else:
+                ok, text = approve_pending_content(conn, row, username)
+                if ok:
+                    message = text
+                else:
+                    error = text
+        body = render_content_admin(message=message, error=error)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [body.encode("utf-8")]
+
+    if path == "/admin/content/approve" and environ.get("REQUEST_METHOD") == "POST":
+        if not user.get("is_admin"):
+            return redirect(start_response, "/")
+        form = parse_post(environ)
+        content_id = form.get("id", "")
         message = "承認しました。"
         error = ""
         with get_db() as conn:
@@ -3649,6 +4418,28 @@ def application(environ, start_response):
         body = render_content_admin(
             load_pending_content(), message="候補を却下しました。"
         )
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [body.encode("utf-8")]
+
+    if path == "/admin/content/edit" and environ.get("REQUEST_METHOD") == "POST":
+        if not user.get("is_admin"):
+            return redirect(start_response, "/")
+        form = parse_post(environ)
+        if update_approved_card(form):
+            body = render_content_admin(message="カードを更新しました。")
+        else:
+            body = render_content_admin(error="カードを更新できませんでした。")
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [body.encode("utf-8")]
+
+    if path == "/admin/content/delete" and environ.get("REQUEST_METHOD") == "POST":
+        if not user.get("is_admin"):
+            return redirect(start_response, "/")
+        form = parse_post(environ)
+        if delete_approved_card(form):
+            body = render_content_admin(message="カードを削除しました。")
+        else:
+            body = render_content_admin(error="カードを削除できませんでした。")
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [body.encode("utf-8")]
 
