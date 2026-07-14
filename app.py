@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from html import escape
 from urllib.parse import parse_qs
+from urllib.request import urlretrieve
 
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "verbs")
@@ -19,12 +20,29 @@ DB_PATH = os.environ.get(
     "VERBI_DB_PATH",
     os.path.join(os.path.dirname(__file__), "data", "verbi.db"),
 )
+DB_DIR = os.path.dirname(DB_PATH) or os.path.join(os.path.dirname(__file__), "data")
+UNIMORPH_ITA_URL = "https://raw.githubusercontent.com/unimorph/ita/master/ita"
+UNIMORPH_CACHE_PATH = os.environ.get(
+    "UNIMORPH_ITA_PATH",
+    os.path.join(DB_DIR, "unimorph_ita.tsv"),
+)
 TOTAL_QUESTIONS = 10
 DEFAULT_DAILY_TARGET = 20
 DEFAULT_ELO = 1200
 ELO_K = 32
 NEW_CONTENT_CHANCE = 0.08
 APP_TIMEZONE = timezone(timedelta(hours=9))
+PERSON_SLOTS = [
+    ("1", "SG", "io"),
+    ("2", "SG", "tu"),
+    ("3", "SG", "lui/lei"),
+    ("1", "PL", "noi"),
+    ("2", "PL", "voi"),
+    ("3", "PL", "loro"),
+]
+SUPPORTED_TENSES = {
+    "presente": {"label": "presente", "features": {"V", "IND", "PRS"}},
+}
 TENSE_JA = {
     "presente": "現在",
     "passato prossimo": "近過去",
@@ -235,7 +253,40 @@ def init_db():
 
             CREATE INDEX IF NOT EXISTS idx_pending_content_status
                 ON pending_content(status);
+
+            CREATE TABLE IF NOT EXISTS content_sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                url TEXT NOT NULL,
+                license_name TEXT NOT NULL,
+                license_url TEXT NOT NULL,
+                attribution TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             """
+        )
+
+        conn.execute(
+            """
+            INSERT INTO content_sources
+                (slug, name, url, license_name, license_url, attribution)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(slug) DO UPDATE SET
+                name = excluded.name,
+                url = excluded.url,
+                license_name = excluded.license_name,
+                license_url = excluded.license_url,
+                attribution = excluded.attribution
+            """,
+            (
+                "unimorph-ita",
+                "UniMorph Italian",
+                "https://github.com/unimorph/ita",
+                "Creative Commons Attribution-ShareAlike 3.0",
+                "https://creativecommons.org/licenses/by-sa/3.0/",
+                "Italian morphological data from UniMorph Italian. UniMorph lists the source as Wikipedia.",
+            ),
         )
 
         user_columns = {
@@ -267,6 +318,16 @@ def init_db():
                 conn.execute(
                     f"ALTER TABLE {table} ADD COLUMN is_new INTEGER NOT NULL DEFAULT 0"
                 )
+            if "source_id" not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN source_id INTEGER")
+
+        for table in ("verbs", "verb_forms", "pending_content"):
+            columns = {
+                row["name"]
+                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if "source_id" not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN source_id INTEGER")
 
         verb_count = conn.execute("SELECT COUNT(*) FROM verbs").fetchone()[0]
         if verb_count == 0:
@@ -1430,6 +1491,196 @@ def load_approved_cards():
     return cards
 
 
+def source_id_by_slug(conn, slug):
+    row = conn.execute(
+        "SELECT id FROM content_sources WHERE slug = ?",
+        (slug,),
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def ensure_unimorph_cache():
+    if os.path.exists(UNIMORPH_CACHE_PATH) and os.path.getsize(UNIMORPH_CACHE_PATH) > 0:
+        return UNIMORPH_CACHE_PATH
+    cache_dir = os.path.dirname(UNIMORPH_CACHE_PATH)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+    try:
+        urlretrieve(UNIMORPH_ITA_URL, UNIMORPH_CACHE_PATH)
+    except Exception as exc:
+        raise RuntimeError(f"UniMorph Italian data could not be downloaded: {exc}") from exc
+    return UNIMORPH_CACHE_PATH
+
+
+def unimorph_slot_key(features):
+    person = None
+    number = None
+    for feature in features:
+        if feature in {"1", "2", "3"}:
+            person = feature
+        elif feature in {"SG", "PL"}:
+            number = feature
+    if person and number:
+        return person, number
+    return None
+
+
+def lookup_unimorph_forms(infinitive, tense):
+    tense_info = SUPPORTED_TENSES.get(tense)
+    if not tense_info:
+        raise ValueError("Unsupported tense.")
+    required = tense_info["features"]
+    forms = {}
+    path = ensure_unimorph_cache()
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) != 3 or parts[0] != infinitive:
+                continue
+            features = set(parts[2].split(";"))
+            if not required.issubset(features):
+                continue
+            slot = unimorph_slot_key(features)
+            if slot and slot not in forms:
+                forms[slot] = parts[1]
+    missing = [
+        label
+        for person, number, label in PERSON_SLOTS
+        if (person, number) not in forms
+    ]
+    if missing:
+        raise ValueError(
+            f"UniMorph has no complete {tense} table for {infinitive}: missing {', '.join(missing)}."
+        )
+    return [
+        {
+            "person": person,
+            "number": number,
+            "pronoun": label,
+            "value": forms[(person, number)],
+        }
+        for person, number, label in PERSON_SLOTS
+    ]
+
+
+def import_unimorph_verb_tense(infinitive, ja, tense):
+    infinitive = infinitive.strip().lower()
+    ja = ja.strip()
+    tense = tense.strip()
+    if not infinitive or not ja:
+        return False, "Verb and translation are required."
+    try:
+        forms = lookup_unimorph_forms(infinitive, tense)
+    except (RuntimeError, ValueError) as exc:
+        return False, str(exc)
+    with get_db() as conn:
+        source_id = source_id_by_slug(conn, "unimorph-ita")
+        verb_id = find_or_create_verb(conn, infinitive, ja)
+        conn.execute(
+            "UPDATE verbs SET source_id = ? WHERE id = ?",
+            (source_id, verb_id),
+        )
+        for form in forms:
+            pronoun = form["pronoun"]
+            value = form["value"]
+            form_row = conn.execute(
+                """
+                SELECT id FROM verb_forms
+                WHERE verb_id = ? AND tense = ? AND pronoun = ? AND gender = ''
+                """,
+                (verb_id, tense, pronoun),
+            ).fetchone()
+            if form_row:
+                form_id = form_row["id"]
+                conn.execute(
+                    """
+                    UPDATE verb_forms
+                    SET value = ?, source_id = ?
+                    WHERE id = ?
+                    """,
+                    (value, source_id, form_id),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO verb_forms
+                        (verb_id, tense, pronoun, value, gender, source_id)
+                    VALUES (?, ?, ?, ?, '', ?)
+                    """,
+                    (verb_id, tense, pronoun, value, source_id),
+                )
+                form_id = cursor.lastrowid
+            prompt = f"{infinitive}|{ja}|{tense}|{pronoun}|"
+            conn.execute(
+                """
+                INSERT INTO questions
+                    (kind, verb_id, verb_form_id, prompt, answer, elo, active, status, is_new, source_id)
+                VALUES ('verb_form', ?, ?, ?, ?, ?, 1, 'approved', 1, ?)
+                ON CONFLICT(kind, verb_id, verb_form_id) DO UPDATE SET
+                    prompt = excluded.prompt,
+                    answer = excluded.answer,
+                    active = 1,
+                    status = 'approved',
+                    is_new = 1,
+                    source_id = excluded.source_id
+                """,
+                (verb_id, form_id, prompt, value, DEFAULT_ELO, source_id),
+            )
+    return True, f"Imported {infinitive} {tense} from UniMorph."
+
+
+def load_verb_trees():
+    init_db()
+    trees = []
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                v.id AS verb_id,
+                v.infinitive,
+                v.ja,
+                vf.tense,
+                vf.pronoun,
+                vf.value,
+                q.id AS question_id,
+                q.elo,
+                q.is_new
+            FROM verbs v
+            JOIN verb_forms vf ON vf.verb_id = v.id
+            JOIN questions q ON q.verb_form_id = vf.id
+            WHERE q.kind = 'verb_form'
+                AND q.active = 1
+                AND q.status = 'approved'
+            ORDER BY v.infinitive, vf.tense, vf.id
+            LIMIT 1200
+            """
+        ).fetchall()
+    by_verb = {}
+    for row in rows:
+        verb = by_verb.setdefault(
+            row["verb_id"],
+            {
+                "id": row["verb_id"],
+                "infinitive": row["infinitive"],
+                "ja": row["ja"],
+                "tenses": {},
+            },
+        )
+        tense = verb["tenses"].setdefault(row["tense"], [])
+        tense.append(
+            {
+                "pronoun": row["pronoun"],
+                "value": row["value"],
+                "question_id": row["question_id"],
+                "elo": row["elo"],
+                "is_new": bool(row["is_new"]),
+            }
+        )
+    for verb in by_verb.values():
+        trees.append(verb)
+    return trees
+
+
 def card_label(card_type):
     return {
         "cloze": "穴埋め",
@@ -1923,6 +2174,393 @@ def render_content_admin(items=None, approved_cards=None, message="", error=""):
       <div class="content-list">{pending_html}</div>
       <h2>承認済みカード</h2>
       <div class="content-list">{approved_html}</div>
+    </main>
+  </body>
+</html>"""
+
+
+def admin_tab_link(tab, label, active_tab):
+    css = "active" if tab == active_tab else ""
+    return f'<a class="{css}" href="/admin/content?tab={escape(tab)}">{escape(label)}</a>'
+
+
+def render_vocab_cards(cards):
+    vocab = [card for card in cards if card["card_type"] == "flashcard"]
+    return (
+        "".join(render_approved_card(card) for card in vocab)
+        if vocab
+        else '<div class="empty">No vocabulary cards.</div>'
+    )
+
+
+def render_cloze_cards(cards):
+    cloze = [card for card in cards if card["card_type"] == "cloze"]
+    return (
+        "".join(render_approved_card(card) for card in cloze)
+        if cloze
+        else '<div class="empty">No cloze cards.</div>'
+    )
+
+
+def tense_options(selected="presente"):
+    return "".join(
+        f'<option value="{escape(key)}" {"selected" if key == selected else ""}>{escape(info["label"])}</option>'
+        for key, info in SUPPORTED_TENSES.items()
+    )
+
+
+def render_tense_import_form():
+    return f"""
+      <form method="post" action="/admin/content/import-tense" class="tense-import">
+        <input name="infinitive" placeholder="andare" autocomplete="off" required />
+        <input name="ja" placeholder="行く" autocomplete="off" required />
+        <select name="tense">{tense_options()}</select>
+        <button title="Import from UniMorph" aria-label="Import from UniMorph" type="submit">&#128190;</button>
+      </form>
+    """
+
+
+def render_verb_trees():
+    trees = load_verb_trees()
+    if not trees:
+        return '<div class="empty">No tense cards.</div>'
+    html = []
+    slot_order = {label: index for index, (_, _, label) in enumerate(PERSON_SLOTS)}
+    for verb in trees:
+        tense_blocks = []
+        for tense, forms in sorted(verb["tenses"].items()):
+            ordered = sorted(forms, key=lambda item: slot_order.get(item["pronoun"], 99))
+            rows = []
+            for item in ordered:
+                new_badge = '<span class="status-new">NEW</span>' if item["is_new"] else ""
+                hidden = (
+                    '<input type="hidden" name="card_type" value="verb_form" />'
+                    f'<input type="hidden" name="id" value="{item["question_id"]}" />'
+                )
+                rows.append(
+                    '<div class="conj-row">'
+                    f'<div class="pronoun-cell">{escape(item["pronoun"])}</div>'
+                    f'<div class="form-cell">{escape(item["value"])}</div>'
+                    f'<div class="elo-cell">ELO {int(item["elo"])} {new_badge}</div>'
+                    '<form method="post" action="/admin/content/reset-elo" class="mini-action">'
+                    f'{hidden}<button title="Reset ELO" aria-label="Reset ELO" type="submit">&#8634;</button>'
+                    '</form>'
+                    '<form method="post" action="/admin/content/delete" class="mini-action">'
+                    f'{hidden}<button class="danger" title="Delete" aria-label="Delete" type="submit">&#128465;</button>'
+                    '</form>'
+                    '</div>'
+                )
+            tense_blocks.append(
+                '<div class="tense-block">'
+                f'<div class="tense-title">{escape(tense)}</div>'
+                f'{"".join(rows)}'
+                '</div>'
+            )
+        html.append(
+            '<div class="verb-tree-card">'
+            f'<div class="verb-tree-head"><strong>{escape(verb["infinitive"])}</strong><span>{escape(verb["ja"])}</span></div>'
+            f'{"".join(tense_blocks)}'
+            '</div>'
+        )
+    return "".join(html)
+
+
+def render_content_admin(items=None, approved_cards=None, message="", error="", active_tab="review"):
+    items = load_pending_content() if items is None else items
+    approved_cards = load_approved_cards() if approved_cards is None else approved_cards
+    message_html = f'<div class="notice ok">{escape(message)}</div>' if message else ""
+    error_html = f'<div class="notice bad">{escape(error)}</div>' if error else ""
+    tabs = "".join(
+        [
+            admin_tab_link("review", "Review", active_tab),
+            admin_tab_link("vocab", "Vocab", active_tab),
+            admin_tab_link("cloze", "Cloze", active_tab),
+            admin_tab_link("tenses", "Tenses", active_tab),
+        ]
+    )
+    if active_tab == "vocab":
+        title = "Vocabulary cards"
+        body_html = f'<div class="content-list">{render_vocab_cards(approved_cards)}</div>'
+    elif active_tab == "cloze":
+        title = "Cloze cards"
+        body_html = f'<div class="content-list">{render_cloze_cards(approved_cards)}</div>'
+    elif active_tab == "tenses":
+        title = "Tense tables"
+        body_html = render_tense_import_form() + f'<div class="tree-list">{render_verb_trees()}</div>'
+    else:
+        title = "Pending review"
+        pending_html = (
+            "".join(render_pending_item(item) for item in items)
+            if items
+            else '<div class="empty">No pending cards.</div>'
+        )
+        body_html = f'<div class="content-list">{pending_html}</div>'
+    return f"""<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>カード管理</title>
+    <style>
+      body {{
+        font-family: Georgia, "Times New Roman", serif;
+        background: #f5f0e6;
+        color: #3d3630;
+        margin: 0;
+        padding: 32px;
+      }}
+      .panel {{
+        max-width: 1180px;
+        margin: 0 auto;
+        background: #fffef9;
+        border: 1px solid #e8e0d4;
+        border-radius: 12px;
+        box-shadow: 0 12px 32px rgba(139, 125, 107, 0.12);
+        padding: 24px;
+      }}
+      .top {{
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 14px;
+      }}
+      h1, h2 {{
+        margin: 0 0 14px;
+      }}
+      h1 {{
+        font-size: 24px;
+      }}
+      h2 {{
+        font-size: 18px;
+        margin-top: 18px;
+      }}
+      a {{
+        color: #8fa68e;
+        font-weight: 600;
+        text-decoration: none;
+      }}
+      .tabs {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 16px;
+      }}
+      .tabs a {{
+        border: 1px solid #d8d0c4;
+        border-radius: 8px;
+        color: #6b635c;
+        padding: 8px 12px;
+      }}
+      .tabs a.active {{
+        background: #8fa68e;
+        border-color: #8fa68e;
+        color: #fff;
+      }}
+      .content-list, .tree-list {{
+        display: grid;
+        gap: 6px;
+        max-height: 70vh;
+        overflow-y: auto;
+        padding-right: 4px;
+      }}
+      .content-item, .verb-tree-card {{
+        background: #faf7f0;
+        border: 1px solid #e8e0d4;
+        border-radius: 10px;
+        padding: 16px;
+      }}
+      .compact-card {{
+        align-items: center;
+        display: grid;
+        gap: 6px;
+        grid-template-columns: 150px minmax(0, 1fr) 32px 32px;
+        padding: 7px 8px;
+      }}
+      .meta, .empty {{
+        color: #7a7065;
+        font-size: 13px;
+        margin-bottom: 8px;
+      }}
+      .compact-meta {{
+        color: #6b635c;
+        font-size: 12px;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }}
+      .status-new {{
+        background: #c4706a;
+        border-radius: 999px;
+        color: #fff;
+        display: inline-block;
+        font-size: 10px;
+        margin-left: 4px;
+        padding: 2px 5px;
+      }}
+      .compact-edit {{
+        align-items: center;
+        display: grid;
+        gap: 6px;
+        grid-template-columns: minmax(0, 1fr) 32px;
+        margin: 0;
+        min-width: 0;
+      }}
+      .compact-fields {{
+        align-items: center;
+        display: flex;
+        gap: 5px;
+        min-width: 0;
+        overflow-x: auto;
+      }}
+      .compact-input {{
+        flex: 1 1 130px;
+        margin-top: 0;
+        min-width: 72px;
+        padding: 6px 7px;
+      }}
+      .compact-input.short {{
+        flex-basis: 84px;
+      }}
+      .compact-input.medium {{
+        flex-basis: 140px;
+      }}
+      .compact-input.wide {{
+        flex-basis: 240px;
+      }}
+      input, select {{
+        box-sizing: border-box;
+        width: 100%;
+        padding: 9px 10px;
+        font-size: 14px;
+        border: 1px solid #d8d0c4;
+        border-radius: 8px;
+        background: #fffef9;
+      }}
+      button {{
+        background: #8fa68e;
+        color: #fff;
+        border: 0;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 14px;
+        height: 32px;
+        padding: 0;
+        width: 32px;
+      }}
+      button.secondary {{
+        background: #b8aa97;
+      }}
+      button.danger {{
+        background: #c4706a;
+      }}
+      .actions-row {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        justify-content: flex-end;
+        margin-top: 12px;
+      }}
+      .actions-row form, .compact-action, .mini-action {{
+        margin: 0;
+      }}
+      .tense-import {{
+        align-items: center;
+        display: grid;
+        gap: 8px;
+        grid-template-columns: minmax(130px, 1fr) minmax(130px, 1fr) 160px 32px;
+        margin-bottom: 14px;
+      }}
+      .verb-tree-card {{
+        padding: 12px;
+      }}
+      .verb-tree-head {{
+        align-items: baseline;
+        display: flex;
+        gap: 12px;
+        margin-bottom: 10px;
+      }}
+      .verb-tree-head strong {{
+        font-size: 20px;
+      }}
+      .verb-tree-head span {{
+        color: #6b635c;
+      }}
+      .tense-block {{
+        border-top: 1px dashed #d8d0c4;
+        padding-top: 8px;
+      }}
+      .tense-title {{
+        color: #8fa68e;
+        font-size: 13px;
+        font-weight: 700;
+        margin-bottom: 6px;
+      }}
+      .conj-row {{
+        align-items: center;
+        display: grid;
+        gap: 8px;
+        grid-template-columns: 84px minmax(120px, 1fr) 120px 32px 32px;
+        min-height: 30px;
+      }}
+      .pronoun-cell {{
+        color: #6b635c;
+        font-weight: 700;
+      }}
+      .form-cell {{
+        font-size: 16px;
+      }}
+      .elo-cell {{
+        color: #7a7065;
+        font-size: 12px;
+        text-align: right;
+      }}
+      .notice {{
+        margin-bottom: 14px;
+        padding: 10px 12px;
+        border-radius: 8px;
+        font-size: 13px;
+      }}
+      .ok {{
+        background: #e9f1e8;
+        color: #557a53;
+      }}
+      .bad {{
+        background: #f7e7e4;
+        color: #9b4d48;
+      }}
+      @media (max-width: 760px) {{
+        body {{
+          padding: 20px;
+        }}
+        .top {{
+          align-items: flex-start;
+          flex-direction: column;
+        }}
+        .compact-card, .conj-row, .tense-import {{
+          grid-template-columns: 1fr;
+        }}
+        .compact-meta {{
+          grid-column: 1 / -1;
+        }}
+        .elo-cell {{
+          text-align: left;
+        }}
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="panel">
+      <div class="top">
+        <h1>カード管理</h1>
+        <a href="/admin">管理へ戻る</a>
+      </div>
+      {message_html}
+      {error_html}
+      <nav class="tabs">{tabs}</nav>
+      <h2>{escape(title)}</h2>
+      {body_html}
     </main>
   </body>
 </html>"""
@@ -4023,6 +4661,261 @@ def render_settings(username, user):
 </html>"""
 
 
+def load_content_sources():
+    init_db()
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT name, url, license_name, license_url, attribution
+            FROM content_sources
+            ORDER BY name
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def render_settings(username, user):
+    nav_html = render_nav(username, user, "設定")
+    daily_target = int(user.get("daily_target", DEFAULT_DAILY_TARGET))
+    vacation_checked = "checked" if user.get("daily_vacation_mode") else ""
+    return f"""<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>設定</title>
+    <style>
+      body {{
+        font-family: Georgia, "Times New Roman", serif;
+        background: #f5f0e6;
+        color: #3d3630;
+        margin: 0;
+        padding: 32px;
+      }}
+      .wrap {{
+        max-width: 720px;
+        margin: 0 auto;
+      }}
+      .topline {{
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: center;
+        margin-bottom: 20px;
+      }}
+      .nav {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+      }}
+      .nav a, .logout, .plain-link {{
+        color: #8fa68e;
+        font-size: 13px;
+        font-weight: 600;
+        text-decoration: none;
+      }}
+      .nav a.active {{
+        color: #4a4239;
+      }}
+      .user-status {{
+        color: #7a7065;
+        font-size: 13px;
+        text-align: right;
+      }}
+      .card {{
+        background: #fffef9;
+        border: 1px solid #e8e0d4;
+        border-radius: 12px;
+        box-shadow: 0 12px 32px rgba(139, 125, 107, 0.12);
+        padding: 24px;
+      }}
+      h1 {{
+        margin: 0 0 18px;
+        font-size: 28px;
+      }}
+      label {{
+        display: block;
+        color: #6b635c;
+        font-size: 14px;
+        margin: 0 0 14px;
+      }}
+      input[type="number"] {{
+        display: block;
+        margin-top: 6px;
+        width: 96px;
+        padding: 10px 12px;
+        border: 1px solid #d8d0c4;
+        border-radius: 8px;
+        background: #fffef9;
+        font-size: 16px;
+      }}
+      button {{
+        background: #8fa68e;
+        border: 0;
+        border-radius: 10px;
+        color: #fff;
+        cursor: pointer;
+        font-size: 15px;
+        font-weight: 600;
+        padding: 11px 16px;
+      }}
+      .setting-links {{
+        border-top: 1px dashed #dcd4c8;
+        margin-top: 18px;
+        padding-top: 16px;
+      }}
+      @media (max-width: 640px) {{
+        body {{
+          padding: 20px;
+        }}
+        .topline {{
+          align-items: flex-start;
+          flex-direction: column;
+        }}
+        .user-status {{
+          text-align: left;
+        }}
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="wrap">
+      {nav_html}
+      <section class="card">
+        <h1>設定</h1>
+        <form method="post" action="/settings">
+          <label>
+            今日の練習の問題数
+            <input type="number" name="daily_target" min="3" max="100" value="{daily_target}" />
+          </label>
+          <label>
+            <input type="checkbox" name="daily_vacation_mode" value="1" {vacation_checked} />
+            休暇モード
+          </label>
+          <button type="submit">保存</button>
+        </form>
+        <div class="setting-links">
+          <a class="plain-link" href="/licenses">データとライセンス</a>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>"""
+
+
+def render_licenses(username, user):
+    nav_html = render_nav(username, user, "設定")
+    source_items = []
+    for source in load_content_sources():
+        source_items.append(
+            '<div class="source-item">'
+            f'<h2>{escape(source["name"])}</h2>'
+            f'<p>{escape(source["attribution"])}</p>'
+            f'<p><a href="{escape(source["url"])}">{escape(source["url"])}</a></p>'
+            f'<p>License: <a href="{escape(source["license_url"])}">{escape(source["license_name"])}</a></p>'
+            '</div>'
+        )
+    sources_html = "".join(source_items) or '<p class="muted">No external data sources registered.</p>'
+    return f"""<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>データとライセンス</title>
+    <style>
+      body {{
+        font-family: Georgia, "Times New Roman", serif;
+        background: #f5f0e6;
+        color: #3d3630;
+        margin: 0;
+        padding: 32px;
+      }}
+      .wrap {{
+        max-width: 820px;
+        margin: 0 auto;
+      }}
+      .topline {{
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: center;
+        margin-bottom: 20px;
+      }}
+      .nav {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+      }}
+      .nav a, .logout, a {{
+        color: #8fa68e;
+        font-weight: 600;
+        text-decoration: none;
+      }}
+      .nav a {{
+        font-size: 13px;
+      }}
+      .user-status {{
+        color: #7a7065;
+        font-size: 13px;
+        text-align: right;
+      }}
+      .card {{
+        background: #fffef9;
+        border: 1px solid #e8e0d4;
+        border-radius: 12px;
+        box-shadow: 0 12px 32px rgba(139, 125, 107, 0.12);
+        padding: 24px;
+      }}
+      h1 {{
+        margin: 0 0 18px;
+        font-size: 28px;
+      }}
+      h2 {{
+        font-size: 18px;
+        margin: 0 0 8px;
+      }}
+      p {{
+        color: #6b635c;
+        line-height: 1.5;
+        margin: 6px 0;
+      }}
+      .source-item {{
+        border-top: 1px dashed #dcd4c8;
+        padding: 16px 0;
+      }}
+      .source-item:first-of-type {{
+        border-top: 0;
+        padding-top: 0;
+      }}
+      .muted {{
+        color: #7a7065;
+      }}
+      @media (max-width: 640px) {{
+        body {{
+          padding: 20px;
+        }}
+        .topline {{
+          align-items: flex-start;
+          flex-direction: column;
+        }}
+        .user-status {{
+          text-align: left;
+        }}
+      }}
+    </style>
+  </head>
+  <body>
+    <main class="wrap">
+      {nav_html}
+      <section class="card">
+        <h1>データとライセンス</h1>
+        {sources_html}
+      </section>
+    </main>
+  </body>
+</html>"""
+
+
 def render_flashcards(username, user, card, options, result=None):
     nav_html = render_nav(username, user, "単語カード")
     new_badge = '<span class="new-badge">NEW</span>' if card.get("is_new") else ""
@@ -4518,7 +5411,25 @@ def application(environ, start_response):
     if path == "/admin/content":
         if not user.get("is_admin"):
             return redirect(start_response, "/")
-        body = render_content_admin(load_pending_content())
+        query = parse_qs(environ.get("QUERY_STRING", ""))
+        active_tab = (query.get("tab") or ["review"])[0]
+        body = render_content_admin(load_pending_content(), active_tab=active_tab)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [body.encode("utf-8")]
+
+    if path == "/admin/content/import-tense" and environ.get("REQUEST_METHOD") == "POST":
+        if not user.get("is_admin"):
+            return redirect(start_response, "/")
+        form = parse_post(environ)
+        ok, text = import_unimorph_verb_tense(
+            form.get("infinitive", ""),
+            form.get("ja", ""),
+            form.get("tense", "presente"),
+        )
+        if ok:
+            body = render_content_admin(message=text, active_tab="tenses")
+        else:
+            body = render_content_admin(error=text, active_tab="tenses")
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [body.encode("utf-8")]
 
@@ -4717,6 +5628,11 @@ def application(environ, start_response):
             )
             return redirect(start_response, "/settings")
         body = render_settings(username, user)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [body.encode("utf-8")]
+
+    if path == "/licenses":
+        body = render_licenses(username, user)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [body.encode("utf-8")]
 
