@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import math
 import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from html import escape, unescape
@@ -5382,8 +5383,17 @@ def sentence_candidates(text):
     ]
 
 
+def normalize_match_text(value):
+    text = value.strip().casefold()
+    text = re.sub(r"([aeiou])['`´]", r"\1", text)
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(char for char in text if unicodedata.category(char) != "Mn")
+    text = text.replace("'", "").replace("`", "").replace("´", "")
+    return text
+
+
 def scraper_word_pattern(terms):
-    terms = sorted({term.strip() for term in terms if term.strip()}, key=len, reverse=True)
+    terms = sorted({normalize_match_text(term) for term in terms if term.strip()}, key=len, reverse=True)
     if not terms:
         return None
     alternatives = []
@@ -5392,7 +5402,6 @@ def scraper_word_pattern(terms):
         alternatives.append(r"\s+".join(escaped_words))
     return re.compile(
         r"(?<![\wÀ-ÖØ-öø-ÿ])(?:" + "|".join(alternatives) + r")(?![\wÀ-ÖØ-öø-ÿ])",
-        re.IGNORECASE,
     )
 
 
@@ -5496,7 +5505,7 @@ def scrape_example_sentences(search_terms, source_urls):
         text = html_to_text(raw)
         for sentence in sentence_candidates(text):
             report["sentences_checked"] += 1
-            if word_pattern and word_pattern.search(sentence):
+            if word_pattern and word_pattern.search(normalize_match_text(sentence)):
                 results.append({"sentence": sentence + ".", "source": url})
                 if len(results) >= SCRAPER_MAX_SENTENCES:
                     report["matches"] = len(results)
@@ -5863,6 +5872,14 @@ def normalize_answer(value):
     while cleaned.endswith("."):
         cleaned = cleaned[:-1].rstrip()
     return cleaned
+
+
+def answer_key(value):
+    return normalize_match_text(normalize_answer(value))
+
+
+def answers_match(user_answer, correct_answer):
+    return answer_key(user_answer) == answer_key(correct_answer)
 
 
 def serve_static_file(path):
@@ -6326,12 +6343,12 @@ def application(environ, start_response):
                 update_function = update_elo
             elif item["game"] == "cloze":
                 correct_answer = normalize_answer(item["answer"])
-                ok = normalize_answer(raw_answer).lower() == correct_answer.lower()
+                ok = answers_match(raw_answer, item["answer"])
                 game = "cloze"
                 update_function = update_cloze_elo
             else:
                 correct_answer = normalize_answer(item["answer"])
-                ok = normalize_answer(raw_answer).lower() == correct_answer.lower()
+                ok = answers_match(raw_answer, item["answer"])
                 game = "verb_form"
                 update_function = update_elo
 
@@ -6408,7 +6425,7 @@ def application(environ, start_response):
             user_answer = normalize_answer(form.get("answer", ""))
             correct_answer = normalize_answer(form.get("correct_answer", ""))
             question_id = form.get("question_id", "")
-            ok = user_answer.lower() == correct_answer.lower()
+            ok = answers_match(user_answer, correct_answer)
             if question_id:
                 update_cloze_elo(username, int(question_id), ok)
             user = increment_practiced_count(username) or user
@@ -6430,7 +6447,7 @@ def application(environ, start_response):
         state = decode_state(form.get("state", ""))
         user_answer = normalize_answer(form.get("user_answer", ""))
         correct = normalize_answer(form.get("q_answer", ""))
-        ok = user_answer.lower() == correct.lower()
+        ok = answers_match(user_answer, correct)
         entry = {
             "infinitive": form.get("q_infinitive", ""),
             "ja": form.get("q_ja", ""),
