@@ -7,11 +7,12 @@ import random
 import secrets
 import sqlite3
 import math
+import re
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
-from html import escape
-from urllib.parse import parse_qs
-from urllib.request import urlretrieve
+from html import escape, unescape
+from urllib.parse import parse_qs, urljoin
+from urllib.request import Request, urlopen, urlretrieve
 
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "verbs")
@@ -31,6 +32,41 @@ DEFAULT_DAILY_TARGET = 20
 DEFAULT_ELO = 1200
 ELO_K = 32
 NEW_CONTENT_CHANCE = 0.08
+SCRAPER_DEFAULT_SOURCES = [
+    "https://www.galileonet.it/feed/",
+    "https://www.linkiesta.it/feed/",
+    "https://www.doppiozero.com/rss.xml",
+    "https://www.lavoce.info/feed/",
+    "https://www.valigiablu.it/feed/",
+    "https://www.ilpost.it/feed/",
+]
+SCRAPER_SOURCE_LIBRARY = [
+    ("Galileo", "scienza", "https://www.galileonet.it/feed/"),
+    ("Scienza in rete", "scienza e societa", "https://www.scienzainrete.it/feed/"),
+    ("Le Scienze", "scienza", "https://www.lescienze.it/rss/"),
+    ("Geopop", "divulgazione", "https://www.geopop.it/feed/"),
+    ("Il Post", "attualita spiegata", "https://www.ilpost.it/feed/"),
+    ("Valigia Blu", "analisi", "https://www.valigiablu.it/feed/"),
+    ("Linkiesta", "analisi e attualita", "https://www.linkiesta.it/feed/"),
+    ("Lavoce.info", "economia", "https://www.lavoce.info/feed/"),
+    ("Doppiozero", "cultura", "https://www.doppiozero.com/rss.xml"),
+    ("Il Tascabile", "cultura e saggistica", "https://www.iltascabile.com/feed/"),
+    ("Rivista Studio", "cultura", "https://www.rivistastudio.com/feed/"),
+    ("Minima et Moralia", "letteratura", "https://www.minimaetmoralia.it/wp/feed/"),
+    ("Giap", "narrazione e societa", "https://www.wumingfoundation.com/giap/feed/"),
+    ("Treccani Magazine", "lingua e cultura", "https://www.treccani.it/magazine/rss.xml"),
+    ("Accademia della Crusca", "lingua italiana", "https://www.accademiadellacrusca.it/it/contenuti/rss.xml"),
+    ("Il Libraio", "libri", "https://www.illibraio.it/feed/"),
+    ("La Cucina Italiana", "cucina", "https://www.lacucinaitaliana.it/feed/rss"),
+    ("Gambero Rosso", "cucina", "https://www.gamberorosso.it/feed/"),
+    ("GreenMe", "ambiente", "https://www.greenme.it/feed/"),
+    ("Pagella Politica", "fact checking", "https://pagellapolitica.it/feed"),
+    ("Open", "attualita", "https://www.open.online/feed/"),
+    ("ANSA", "notizie brevi", "https://www.ansa.it/sito/ansait_rss.xml"),
+]
+SCRAPER_MAX_SOURCE_LINKS = 4
+SCRAPER_MAX_SENTENCES = 80
+SCRAPER_TIMEOUT_SECONDS = 4
 APP_TIMEZONE = timezone(timedelta(hours=9))
 PERSON_SLOTS = [
     ("1", "SG", "io"),
@@ -42,6 +78,7 @@ PERSON_SLOTS = [
 ]
 SUPPORTED_TENSES = {
     "presente": {"label": "presente", "features": {"V", "IND", "PRS"}},
+    "passato prossimo": {"label": "passato prossimo", "compound": True},
 }
 TENSE_JA = {
     "presente": "現在",
@@ -1527,7 +1564,7 @@ def unimorph_slot_key(features):
 
 def lookup_unimorph_forms(infinitive, tense):
     tense_info = SUPPORTED_TENSES.get(tense)
-    if not tense_info:
+    if not tense_info or "features" not in tense_info:
         raise ValueError("Unsupported tense.")
     required = tense_info["features"]
     forms = {}
@@ -2222,6 +2259,7 @@ def tense_options(selected="presente"):
     return "".join(
         f'<option value="{escape(key)}" {"selected" if key == selected else ""}>{escape(info["label"])}</option>'
         for key, info in SUPPORTED_TENSES.items()
+        if "features" in info
     )
 
 
@@ -5297,6 +5335,519 @@ def render_cloze(username, user, question, result=None):
 </html>"""
 
 
+def fetch_url_text(url):
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; VerbiSentencePrep/1.0)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    )
+    with urlopen(request, timeout=SCRAPER_TIMEOUT_SECONDS) as response:
+        content_type = response.headers.get_content_charset() or "utf-8"
+        raw = response.read(1_500_000)
+    return raw.decode(content_type, errors="replace")
+
+
+def html_to_text(raw):
+    cleaned = re.sub(r"(?is)<(script|style|noscript).*?</\1>", " ", raw)
+    cleaned = re.sub(r"(?s)<!--.*?-->", " ", cleaned)
+    cleaned = re.sub(r"(?s)<[^>]+>", " ", cleaned)
+    cleaned = unescape(cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def extract_links(raw, base_url):
+    links = []
+    for match in re.finditer(r"(?is)<link>\s*(.*?)\s*</link>", raw):
+        links.append(urljoin(base_url, unescape(match.group(1).strip())))
+    for match in re.finditer(r'''(?is)<a\s+[^>]*href=["']([^"']+)["']''', raw):
+        links.append(urljoin(base_url, unescape(match.group(1).strip())))
+    deduped = []
+    seen = set()
+    for link in links:
+        if not link.startswith(("http://", "https://")) or link in seen:
+            continue
+        seen.add(link)
+        deduped.append(link)
+    return deduped[:SCRAPER_MAX_SOURCE_LINKS]
+
+
+def sentence_candidates(text):
+    # Intentionally simple first pass: keep spans between full stops.
+    return [
+        part.strip()
+        for part in text.split(".")
+        if 35 <= len(part.strip()) <= 320
+    ]
+
+
+def scraper_word_pattern(terms):
+    terms = sorted({term.strip() for term in terms if term.strip()}, key=len, reverse=True)
+    if not terms:
+        return None
+    alternatives = []
+    for term in terms:
+        escaped_words = [re.escape(part) for part in term.split()]
+        alternatives.append(r"\s+".join(escaped_words))
+    return re.compile(
+        r"(?<![\wÀ-ÖØ-öø-ÿ])(?:" + "|".join(alternatives) + r")(?![\wÀ-ÖØ-öø-ÿ])",
+        re.IGNORECASE,
+    )
+
+
+def unimorph_values_by_features(infinitive, required_features):
+    values = []
+    seen = set()
+    path = ensure_unimorph_cache()
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) != 3 or parts[0] != infinitive:
+                continue
+            features = set(parts[2].split(";"))
+            if not required_features.issubset(features):
+                continue
+            value = parts[1].strip()
+            if value and value not in seen:
+                seen.add(value)
+                values.append(value)
+    return values
+
+
+def unimorph_present_by_pronoun(infinitive):
+    rows = lookup_unimorph_forms(infinitive, "presente")
+    return {row["pronoun"]: row["value"] for row in rows}
+
+
+def past_participle_variants(participle):
+    if participle.endswith("o"):
+        stem = participle[:-1]
+        return {
+            "masculine": stem + "o",
+            "feminine": stem + "a",
+            "masculine plural": stem + "i",
+            "feminine plural": stem + "e",
+        }
+    return {
+        "masculine": participle,
+        "feminine": participle,
+        "masculine plural": participle,
+        "feminine plural": participle,
+    }
+
+
+def unimorph_search_terms(infinitive, tense):
+    infinitive = infinitive.strip().lower()
+    if not infinitive:
+        raise ValueError("Verb is required.")
+    if tense == "presente":
+        return [row["value"] for row in lookup_unimorph_forms(infinitive, tense)]
+    if tense == "passato prossimo":
+        participles = unimorph_values_by_features(infinitive, {"V.PTCP", "PST"})
+        if not participles:
+            raise ValueError(f"UniMorph has no past participle for {infinitive}.")
+        participle = participles[0]
+        avere = unimorph_present_by_pronoun("avere")
+        essere = unimorph_present_by_pronoun("essere")
+        variants = past_participle_variants(participle)
+        terms = []
+        for pronoun in ("io", "tu", "lui/lei", "noi", "voi", "loro"):
+            if pronoun in avere:
+                terms.append(f"{avere[pronoun]} {variants['masculine']}")
+            if pronoun in essere:
+                if pronoun in {"io", "tu", "lui/lei"}:
+                    terms.append(f"{essere[pronoun]} {variants['masculine']}")
+                    terms.append(f"{essere[pronoun]} {variants['feminine']}")
+                else:
+                    terms.append(f"{essere[pronoun]} {variants['masculine plural']}")
+                    terms.append(f"{essere[pronoun]} {variants['feminine plural']}")
+        return terms
+    raise ValueError("Unsupported tense.")
+
+
+def scrape_example_sentences(search_terms, source_urls):
+    word_pattern = scraper_word_pattern(search_terms)
+    results = []
+    errors = []
+    report = {
+        "sources": len(source_urls),
+        "terms": len(search_terms),
+        "search_terms": list(search_terms),
+        "visited": 0,
+        "links_found": 0,
+        "sentences_checked": 0,
+        "matches": 0,
+        "per_url": {},
+    }
+    visited = set()
+
+    def scan_url(url, follow_links=False):
+        if url in visited or len(results) >= SCRAPER_MAX_SENTENCES:
+            return
+        visited.add(url)
+        report["visited"] += 1
+        before_matches = len(results)
+        try:
+            raw = fetch_url_text(url)
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+            return
+        text = html_to_text(raw)
+        for sentence in sentence_candidates(text):
+            report["sentences_checked"] += 1
+            if word_pattern and word_pattern.search(sentence):
+                results.append({"sentence": sentence + ".", "source": url})
+                if len(results) >= SCRAPER_MAX_SENTENCES:
+                    report["matches"] = len(results)
+                    report["per_url"][url] = len(results) - before_matches
+                    return
+        found_here = len(results) - before_matches
+        if found_here:
+            report["per_url"][url] = found_here
+        if follow_links:
+            links = extract_links(raw, url)
+            report["links_found"] += len(links)
+            for link in links:
+                scan_url(link, follow_links=False)
+                if len(results) >= SCRAPER_MAX_SENTENCES:
+                    report["matches"] = len(results)
+                    return
+
+    for source_url in source_urls:
+        scan_url(source_url, follow_links=True)
+    report["matches"] = len(results)
+    return results, errors, report
+
+
+def render_sentence_scraper(username, user, word="", tense="", sources="", results=None, errors=None, report=None):
+    nav_html = render_nav(username, user, "管理")
+    default_sources = "\n".join(SCRAPER_DEFAULT_SOURCES)
+    sources_value = sources if sources else default_sources
+    results = results or []
+    errors = errors or []
+    report = report or {}
+    search_tense_options = '<option value="" selected>単語だけ</option>'
+    search_tense_options += "".join(
+        f'<option value="{escape(key)}" {"selected" if key == tense else ""}>{escape(info["label"])}</option>'
+        for key, info in SUPPORTED_TENSES.items()
+    )
+    result_html = (
+        "".join(
+            '<div class="result-item">'
+            f'<div class="sentence">{escape(item["sentence"])}</div>'
+            f'<div class="source">{escape(item["source"])}</div>'
+            "</div>"
+            for item in results
+        )
+        if results
+        else '<div class="empty">まだ例文はありません。</div>'
+    )
+    errors_html = (
+        '<div class="errors">'
+        + "".join(f'<div>{escape(error)}</div>' for error in errors[:12])
+        + "</div>"
+        if errors
+        else ""
+    )
+    report_html = ""
+    if report:
+        per_url = report.get("per_url", {})
+        per_url_html = "".join(
+            f'<li>{escape(url)}: {count}</li>'
+            for url, count in per_url.items()
+        )
+        terms_preview = ", ".join(report.get("search_terms", [])[:24])
+        terms_html = f'<div class="terms-preview">{escape(terms_preview)}</div>' if terms_preview else ""
+        report_html = f"""
+        <div class="run-report">
+          <strong>収集レポート</strong>
+          <div>入力ソース: {int(report.get("sources", 0))}</div>
+          <div>検索フォーム数: {int(report.get("terms", 0))}</div>
+          {terms_html}
+          <div>確認したURL: {int(report.get("visited", 0))}</div>
+          <div>見つけた記事リンク: {int(report.get("links_found", 0))}</div>
+          <div>確認した文候補: {int(report.get("sentences_checked", 0))}</div>
+          <div>一致した例文: {int(report.get("matches", 0))}</div>
+          <ul>{per_url_html}</ul>
+        </div>
+        """
+    source_library_html = "".join(
+        '<div class="source-row">'
+        f'<div><strong>{escape(name)}</strong><span>{escape(kind)}</span></div>'
+        f'<code>{escape(url)}</code>'
+        f'<button class="mini-button" type="button" data-source="{escape(url)}" onclick="addSource(this)">+</button>'
+        "</div>"
+        for name, kind, url in SCRAPER_SOURCE_LIBRARY
+    )
+    all_source_urls = "\n".join(url for _, _, url in SCRAPER_SOURCE_LIBRARY)
+    return f"""<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>例文スクレイパー</title>
+    <style>
+      body {{
+        font-family: Georgia, "Times New Roman", serif;
+        background: #f5f0e6;
+        color: #3d3630;
+        margin: 0;
+        padding: 32px;
+      }}
+      .wrap {{
+        max-width: 980px;
+        margin: 0 auto;
+      }}
+      .topline {{
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: center;
+        margin-bottom: 20px;
+      }}
+      .nav {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+      }}
+      .nav a, .logout {{
+        color: #8fa68e;
+        font-size: 13px;
+        font-weight: 600;
+        text-decoration: none;
+      }}
+      .card {{
+        background: #fffef9;
+        border: 1px solid #e8e0d4;
+        border-radius: 12px;
+        box-shadow: 0 12px 32px rgba(139, 125, 107, 0.12);
+        padding: 24px;
+      }}
+      h1 {{
+        margin: 0 0 18px;
+        font-size: 26px;
+      }}
+      label {{
+        color: #6b635c;
+        display: block;
+        font-size: 13px;
+        font-weight: 600;
+        margin: 12px 0 6px;
+      }}
+      input, textarea, select {{
+        box-sizing: border-box;
+        width: 100%;
+        padding: 10px 12px;
+        font-size: 15px;
+        border: 1px solid #d8d0c4;
+        border-radius: 8px;
+        background: #fffef9;
+      }}
+      .search-grid {{
+        display: grid;
+        gap: 12px;
+        grid-template-columns: minmax(0, 1fr) 220px;
+      }}
+      textarea {{
+        min-height: 120px;
+        resize: vertical;
+      }}
+      button {{
+        background: #8fa68e;
+        border: 0;
+        border-radius: 10px;
+        color: #fff;
+        cursor: pointer;
+        font-size: 15px;
+        font-weight: 600;
+        margin-top: 14px;
+        padding: 11px 16px;
+      }}
+      .result-list {{
+        display: grid;
+        gap: 8px;
+        margin-top: 18px;
+      }}
+      .result-item {{
+        background: #faf7f0;
+        border: 1px solid #e8e0d4;
+        border-radius: 8px;
+        padding: 12px;
+      }}
+      .sentence {{
+        font-size: 15px;
+        line-height: 1.45;
+      }}
+      .source, .empty {{
+        color: #7a7065;
+        font-size: 12px;
+        margin-top: 5px;
+      }}
+      .source-library {{
+        border-top: 1px solid #e8e0d4;
+        display: grid;
+        gap: 6px;
+        margin-top: 16px;
+        padding-top: 14px;
+      }}
+      .source-library-head {{
+        align-items: center;
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+        margin-bottom: 6px;
+      }}
+      .source-library-head h2 {{
+        font-size: 15px;
+        margin: 0;
+      }}
+      .source-row {{
+        align-items: center;
+        display: grid;
+        gap: 8px;
+        grid-template-columns: 180px minmax(0, 1fr) auto;
+      }}
+      .source-row span {{
+        color: #7a7065;
+        display: block;
+        font-size: 11px;
+        font-weight: 400;
+      }}
+      .source-row code {{
+        background: #faf7f0;
+        border: 1px solid #e8e0d4;
+        border-radius: 6px;
+        color: #6b635c;
+        font-family: Consolas, monospace;
+        font-size: 12px;
+        min-width: 0;
+        overflow: hidden;
+        padding: 5px 7px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }}
+      .mini-button {{
+        border-radius: 7px;
+        font-size: 13px;
+        line-height: 1;
+        margin: 0;
+        min-width: 30px;
+        padding: 7px 8px;
+      }}
+      .errors {{
+        background: #f7e7e4;
+        border-radius: 8px;
+        color: #9b4d48;
+        font-size: 12px;
+        margin-top: 14px;
+        padding: 10px 12px;
+      }}
+      .run-report, .working {{
+        background: #f0ebe3;
+        border-radius: 8px;
+        color: #6b635c;
+        font-size: 13px;
+        line-height: 1.45;
+        margin-top: 14px;
+        padding: 10px 12px;
+      }}
+      .run-report ul {{
+        margin: 6px 0 0 18px;
+        padding: 0;
+      }}
+      .terms-preview {{
+        color: #7a7065;
+        font-size: 12px;
+        margin: 4px 0 6px;
+      }}
+      .working {{
+        display: none;
+      }}
+      @media (max-width: 720px) {{
+        .search-grid, .source-row {{
+          grid-template-columns: 1fr;
+        }}
+      }}
+    </style>
+    <script>
+      function showScrapeStatus() {{
+        var box = document.getElementById("scrape-status");
+        if (box) {{
+          box.style.display = "block";
+          box.textContent = "ソースと記事リンクを確認中です。各ページは最大{SCRAPER_TIMEOUT_SECONDS}秒でタイムアウトし、各ソースから最大{SCRAPER_MAX_SOURCE_LINKS}件の記事を確認します。";
+        }}
+      }}
+      function addSource(button) {{
+        var textarea = document.querySelector("textarea[name='sources']");
+        var url = button.getAttribute("data-source");
+        if (!textarea || !url) {{
+          return;
+        }}
+        addSources([url]);
+      }}
+      function addSources(urls) {{
+        var textarea = document.querySelector("textarea[name='sources']");
+        if (!textarea) {{
+          return;
+        }}
+        var lines = textarea.value.split(/\\r?\\n/).map(function(line) {{ return line.trim(); }});
+        urls.forEach(function(url) {{
+          if (lines.indexOf(url) === -1) {{
+            lines.push(url);
+          }}
+        }});
+        lines = lines.filter(function(line, index) {{
+          return line && lines.indexOf(line) === index;
+        }});
+        textarea.value = lines.join("\\n");
+      }}
+      function addAllSources() {{
+        var urls = document.getElementById("all-source-urls").value.split(/\\r?\\n/);
+        addSources(urls);
+      }}
+    </script>
+  </head>
+  <body>
+    <main class="wrap">
+      {nav_html}
+      <section class="card">
+        <h1>例文スクレイパー</h1>
+        <form method="post" action="/admin/sentence-scraper" onsubmit="showScrapeStatus()">
+          <div class="search-grid">
+            <div>
+              <label>検索する語 / 動詞</label>
+              <input name="word" value="{escape(word)}" placeholder="andare" required />
+            </div>
+            <div>
+              <label>時制</label>
+              <select name="tense">{search_tense_options}</select>
+            </div>
+          </div>
+          <label>ソースURL（RSSまたはページ、1行に1つ）</label>
+          <textarea name="sources">{escape(sources_value)}</textarea>
+          <button type="submit">収集</button>
+        </form>
+        <div class="source-library">
+          <div class="source-library-head">
+            <h2>ソース候補</h2>
+            <button class="mini-button" type="button" onclick="addAllSources()">全部追加</button>
+          </div>
+          <textarea id="all-source-urls" hidden>{escape(all_source_urls)}</textarea>
+          {source_library_html}
+        </div>
+        <div id="scrape-status" class="working"></div>
+        {report_html}
+        {errors_html}
+        <div class="result-list">
+          {result_html}
+        </div>
+      </section>
+    </main>
+  </body>
+</html>"""
+
+
 def parse_post(environ):
     try:
         length = int(environ.get("CONTENT_LENGTH", "0"))
@@ -5471,6 +6022,39 @@ def application(environ, start_response):
             return redirect(start_response, "/")
         users = load_users()
         body = render_admin(users)
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [body.encode("utf-8")]
+
+    if path == "/admin/sentence-scraper":
+        if not user.get("is_admin"):
+            return redirect(start_response, "/")
+        if environ.get("REQUEST_METHOD") == "POST":
+            form = parse_post(environ)
+            word = form.get("word", "").strip()
+            tense = form.get("tense", "").strip()
+            sources = form.get("sources", "")
+            source_urls = [
+                line.strip()
+                for line in sources.splitlines()
+                if line.strip().startswith(("http://", "https://"))
+            ]
+            try:
+                search_terms = unimorph_search_terms(word, tense) if tense else [word]
+                results, errors, report = scrape_example_sentences(search_terms, source_urls)
+            except (RuntimeError, ValueError) as exc:
+                results, errors, report = [], [str(exc)], {"sources": len(source_urls), "terms": 0}
+            body = render_sentence_scraper(
+                username,
+                user,
+                word=word,
+                tense=tense,
+                sources=sources,
+                results=results,
+                errors=errors,
+                report=report,
+            )
+        else:
+            body = render_sentence_scraper(username, user)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [body.encode("utf-8")]
 
