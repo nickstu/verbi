@@ -38,10 +38,10 @@ STUDY_LANGUAGES = {
         "verb_enabled": True,
     },
     "ja_en": {
-        "label": "日本語 -> English",
-        "short": "日本語",
-        "flashcard_description": "日本語の単語を見て、英語の意味を選びます。",
-        "cloze_description": "日本語の文の空欄に入る語を入力します。下に英語訳が表示されます。",
+        "label": "English -> 日本語",
+        "short": "英語",
+        "flashcard_description": "英語の単語を見て、日本語の意味を選びます。",
+        "cloze_description": "英語の文の空欄に入る語を入力します。下に日本語訳が表示されます。",
         "verb_enabled": False,
     },
 }
