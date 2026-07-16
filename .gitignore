@@ -3,3 +3,5 @@ __pycache__/
 *.log
 data/users.json
 data/verbi.db-*
+data/runtime.db
+data/runtime.db-*

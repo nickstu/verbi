@@ -1,4 +1,4 @@
-import base64
+﻿import base64
 import hashlib
 import hmac
 import json
@@ -9,6 +9,7 @@ import sqlite3
 import math
 import re
 import unicodedata
+import contextvars
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from http.cookiejar import CookieJar
@@ -22,8 +23,30 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "verbs")
 USERS_PATH = os.path.join(os.path.dirname(__file__), "data", "users.json")
 DB_PATH = os.environ.get(
     "VERBI_DB_PATH",
-    os.path.join(os.path.dirname(__file__), "data", "verbi.db"),
+    os.path.join(os.path.dirname(__file__), "data", "runtime.db"),
 )
+MATERIAL_DB_PATHS = {
+    "it_ja": os.path.join(os.path.dirname(__file__), "data", "verbi.db"),
+    "ja_en": os.path.join(os.path.dirname(__file__), "data", "japanese_english.db"),
+}
+STUDY_LANGUAGES = {
+    "it_ja": {
+        "label": "Italiano -> 日本語",
+        "short": "イタリア語",
+        "flashcard_description": "イタリア語の単語を見て、日本語の意味を選びます。",
+        "cloze_description": "イタリア語の文の空欄に入る単語を入力します。下に日本語訳が表示されます。",
+        "verb_enabled": True,
+    },
+    "ja_en": {
+        "label": "日本語 -> English",
+        "short": "日本語",
+        "flashcard_description": "日本語の単語を見て、英語の意味を選びます。",
+        "cloze_description": "日本語の文の空欄に入る語を入力します。下に英語訳が表示されます。",
+        "verb_enabled": False,
+    },
+}
+DEFAULT_STUDY_LANGUAGE = "it_ja"
+ACTIVE_MATERIAL_DB = contextvars.ContextVar("ACTIVE_MATERIAL_DB", default=MATERIAL_DB_PATHS[DEFAULT_STUDY_LANGUAGE])
 DB_DIR = os.path.dirname(DB_PATH) or os.path.join(os.path.dirname(__file__), "data")
 TOTAL_QUESTIONS = 10
 DEFAULT_DAILY_TARGET = 20
@@ -83,7 +106,7 @@ GENDER_LABELS = {
     "feminine plural": "femminile 女性",
 }
 ALL_GENDERS = list(GENDER_LABELS.keys())
-DB_INITIALIZED = False
+DB_INITIALIZED = set()
 VERBECC_CONJUGATOR = None
 
 
@@ -211,11 +234,30 @@ CLOZE_EXAMPLES = [
 ]
 
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
+def material_db_path_for_language(language):
+    return MATERIAL_DB_PATHS.get(language, MATERIAL_DB_PATHS[DEFAULT_STUDY_LANGUAGE])
+
+
+def get_db(path=None, foreign_keys=True):
+    conn = sqlite3.connect(path or ACTIVE_MATERIAL_DB.get())
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute(f"PRAGMA foreign_keys = {'ON' if foreign_keys else 'OFF'}")
     return conn
+
+
+def get_runtime_db():
+    return get_db(DB_PATH, foreign_keys=False)
+
+
+def study_language(user):
+    language = user.get("study_language") or DEFAULT_STUDY_LANGUAGE
+    if language not in STUDY_LANGUAGES:
+        return DEFAULT_STUDY_LANGUAGE
+    return language
+
+
+def set_active_material_language(user):
+    ACTIVE_MATERIAL_DB.set(material_db_path_for_language(study_language(user)))
 
 
 def load_seed_verbs():
@@ -231,15 +273,18 @@ def load_seed_verbs():
     return verbs
 
 
-def init_db():
+def init_db(path=None):
     global DB_INITIALIZED
-    if DB_INITIALIZED:
+    if not isinstance(DB_INITIALIZED, set):
+        DB_INITIALIZED = set()
+    db_path = path or ACTIVE_MATERIAL_DB.get()
+    if db_path in DB_INITIALIZED:
         return
 
-    db_dir = os.path.dirname(DB_PATH)
+    db_dir = os.path.dirname(db_path)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
-    with get_db() as conn:
+    with get_db(db_path) as conn:
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -424,6 +469,7 @@ def init_db():
             "daily_last_completed": "TEXT NOT NULL DEFAULT ''",
             "daily_vacation_mode": "INTEGER NOT NULL DEFAULT 0",
             "daily_state_json": "TEXT NOT NULL DEFAULT ''",
+            "study_language": f"TEXT NOT NULL DEFAULT '{DEFAULT_STUDY_LANGUAGE}'",
         }
         for column, definition in user_migrations.items():
             if column not in user_columns:
@@ -472,8 +518,10 @@ def init_db():
                 if column not in columns:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
+        is_italian_material_db = os.path.abspath(db_path) == os.path.abspath(MATERIAL_DB_PATHS["it_ja"])
+
         verb_count = conn.execute("SELECT COUNT(*) FROM verbs").fetchone()[0]
-        if verb_count == 0:
+        if verb_count == 0 and is_italian_material_db:
             for verb in load_seed_verbs():
                 cursor = conn.execute(
                     "INSERT INTO verbs (infinitive, ja) VALUES (?, ?)",
@@ -530,7 +578,7 @@ def init_db():
         cloze_count = conn.execute(
             "SELECT COUNT(*) FROM cloze_questions"
         ).fetchone()[0]
-        if cloze_count == 0:
+        if cloze_count == 0 and is_italian_material_db:
             conn.executemany(
                 """
                 INSERT OR IGNORE INTO cloze_questions
@@ -575,8 +623,9 @@ def init_db():
             """
         )
 
+        is_runtime_db = os.path.abspath(db_path) == os.path.abspath(DB_PATH)
         user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        if user_count == 0 and os.path.exists(USERS_PATH):
+        if is_runtime_db and user_count == 0 and os.path.exists(USERS_PATH):
             try:
                 with open(USERS_PATH, "r", encoding="utf-8") as f:
                     data = json.load(f)
@@ -629,13 +678,13 @@ def init_db():
                     ),
                 )
 
-    DB_INITIALIZED = True
+    DB_INITIALIZED.add(db_path)
 
 
 def load_users():
-    init_db()
+    init_db(DB_PATH)
     users = {}
-    with get_db() as conn:
+    with get_runtime_db() as conn:
         rows = conn.execute("SELECT * FROM users ORDER BY name").fetchall()
     for row in rows:
         try:
@@ -652,6 +701,7 @@ def load_users():
             "daily_streak": int(row["daily_streak"]),
             "daily_last_completed": row["daily_last_completed"],
             "daily_vacation_mode": bool(row["daily_vacation_mode"]),
+            "study_language": row["study_language"] if "study_language" in row.keys() else DEFAULT_STUDY_LANGUAGE,
             "state": state,
             "session_token": row["session_token"],
             "password_reset_required": bool(row["password_reset_required"]),
@@ -661,14 +711,14 @@ def load_users():
 
 
 def has_users():
-    init_db()
-    with get_db() as conn:
+    init_db(DB_PATH)
+    with get_runtime_db() as conn:
         return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0
 
 
 def save_users(data):
-    init_db()
-    with get_db() as conn:
+    init_db(DB_PATH)
+    with get_runtime_db() as conn:
         for name, user in data.get("users", {}).items():
             state = dict(user.get("state") or {})
             practiced = int(state.pop("practiced_count", 0))
@@ -684,12 +734,13 @@ def save_users(data):
                         daily_streak,
                         daily_last_completed,
                         daily_vacation_mode,
+                        study_language,
                         session_token,
                         password_reset_required,
                         is_admin,
                         state_json
                     )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     password_hash = excluded.password_hash,
                     practiced_count = excluded.practiced_count,
@@ -698,6 +749,7 @@ def save_users(data):
                     daily_streak = excluded.daily_streak,
                     daily_last_completed = excluded.daily_last_completed,
                     daily_vacation_mode = excluded.daily_vacation_mode,
+                    study_language = excluded.study_language,
                     session_token = excluded.session_token,
                     password_reset_required = excluded.password_reset_required,
                     is_admin = excluded.is_admin,
@@ -712,6 +764,7 @@ def save_users(data):
                     int(user.get("daily_streak", 0)),
                     user.get("daily_last_completed", ""),
                     1 if user.get("daily_vacation_mode") else 0,
+                    study_language(user),
                     user.get("session_token", ""),
                     1 if user.get("password_reset_required") else 0,
                     1 if user.get("is_admin") or name == "admin" else 0,
@@ -3114,43 +3167,45 @@ def record_user_card_seen(conn, username, card_uid, card_type, revision, correct
 
 def update_elo(username, question_id, correct, game):
     init_db()
+    init_db(DB_PATH)
+    with get_runtime_db() as runtime_conn:
+        user_row = runtime_conn.execute("SELECT elo FROM users WHERE name = ?", (username,)).fetchone()
     with get_db() as conn:
-        user_row = conn.execute(
-            "SELECT elo FROM users WHERE name = ?", (username,)
-        ).fetchone()
         question_row = conn.execute(
             "SELECT elo, uid, revision FROM questions WHERE id = ?", (question_id,)
         ).fetchone()
-        if not user_row or not question_row:
-            return None
+    if not user_row or not question_row:
+        return None
 
-        user_before = int(user_row["elo"])
-        question_before = int(question_row["elo"])
-        actual = 1 if correct else 0
-        expected = expected_score(user_before, question_before)
-        user_after = round(user_before + ELO_K * (actual - expected))
-        question_actual = 1 - actual
-        question_expected = 1 - expected
-        question_after = round(
-            question_before + ELO_K * (question_actual - question_expected)
-        )
+    user_before = int(user_row["elo"])
+    question_before = int(question_row["elo"])
+    actual = 1 if correct else 0
+    expected = expected_score(user_before, question_before)
+    user_after = round(user_before + ELO_K * (actual - expected))
+    question_actual = 1 - actual
+    question_expected = 1 - expected
+    question_after = round(
+        question_before + ELO_K * (question_actual - question_expected)
+    )
 
-        conn.execute(
-            "UPDATE users SET elo = ? WHERE name = ?", (user_after, username)
-        )
+    with get_db() as conn:
         conn.execute(
             "UPDATE questions SET elo = ? WHERE id = ?",
             (question_after, question_id),
         )
+    with get_runtime_db() as runtime_conn:
+        runtime_conn.execute(
+            "UPDATE users SET elo = ? WHERE name = ?", (user_after, username)
+        )
         record_user_card_seen(
-            conn,
+            runtime_conn,
             username,
             question_row["uid"],
             game,
             int(question_row["revision"]),
             bool(correct),
         )
-        conn.execute(
+        runtime_conn.execute(
             """
             INSERT INTO practice_events
                 (
@@ -3190,41 +3245,43 @@ def update_elo(username, question_id, correct, game):
 
 def update_cloze_elo(username, question_id, correct):
     init_db()
+    init_db(DB_PATH)
+    with get_runtime_db() as runtime_conn:
+        user_row = runtime_conn.execute("SELECT elo FROM users WHERE name = ?", (username,)).fetchone()
     with get_db() as conn:
-        user_row = conn.execute(
-            "SELECT elo FROM users WHERE name = ?", (username,)
-        ).fetchone()
         question_row = conn.execute(
             "SELECT elo, uid, revision FROM cloze_questions WHERE id = ?", (question_id,)
         ).fetchone()
-        if not user_row or not question_row:
-            return None
+    if not user_row or not question_row:
+        return None
 
-        user_before = int(user_row["elo"])
-        question_before = int(question_row["elo"])
-        actual = 1 if correct else 0
-        expected = expected_score(user_before, question_before)
-        user_after = round(user_before + ELO_K * (actual - expected))
-        question_after = round(
-            question_before + ELO_K * ((1 - actual) - (1 - expected))
-        )
+    user_before = int(user_row["elo"])
+    question_before = int(question_row["elo"])
+    actual = 1 if correct else 0
+    expected = expected_score(user_before, question_before)
+    user_after = round(user_before + ELO_K * (actual - expected))
+    question_after = round(
+        question_before + ELO_K * ((1 - actual) - (1 - expected))
+    )
 
-        conn.execute(
-            "UPDATE users SET elo = ? WHERE name = ?", (user_after, username)
-        )
+    with get_db() as conn:
         conn.execute(
             "UPDATE cloze_questions SET elo = ? WHERE id = ?",
             (question_after, question_id),
         )
+    with get_runtime_db() as runtime_conn:
+        runtime_conn.execute(
+            "UPDATE users SET elo = ? WHERE name = ?", (user_after, username)
+        )
         record_user_card_seen(
-            conn,
+            runtime_conn,
             username,
             question_row["uid"],
             "cloze",
             int(question_row["revision"]),
             bool(correct),
         )
-        conn.execute(
+        runtime_conn.execute(
             """
             INSERT INTO cloze_practice_events
                 (
@@ -3276,25 +3333,27 @@ def weighted_row_by_elo(rows, user_elo):
     return random.choices(rows, weights=weights, k=1)[0]
 
 
-def user_seen_card_uids(conn, username, card_type):
-    return {
-        row["card_uid"]
-        for row in conn.execute(
-            """
-            SELECT card_uid
-            FROM user_card_state
-            WHERE user_name = ? AND card_type = ?
-            """,
-            (username, card_type),
-        ).fetchall()
-    }
+def user_seen_card_uids(username, card_type):
+    init_db(DB_PATH)
+    with get_runtime_db() as conn:
+        return {
+            row["card_uid"]
+            for row in conn.execute(
+                """
+                SELECT card_uid
+                FROM user_card_state
+                WHERE user_name = ? AND card_type = ?
+                """,
+                (username, card_type),
+            ).fetchall()
+        }
 
 
 def choose_user_card_subset(rows, conn, user, card_type, force_new):
     rows = list(rows)
     if not rows:
         return rows
-    seen = user_seen_card_uids(conn, user.get("name", ""), card_type)
+    seen = user_seen_card_uids(user.get("name", ""), card_type)
     if force_new:
         unseen_rows = [row for row in rows if row["uid"] not in seen]
         if unseen_rows:
@@ -3484,8 +3543,8 @@ def pick_flashcard(user):
 
 
 def increment_practiced_count(username):
-    init_db()
-    with get_db() as conn:
+    init_db(DB_PATH)
+    with get_runtime_db() as conn:
         conn.execute(
             """
             UPDATE users
@@ -3517,7 +3576,10 @@ def distribute_daily_counts(total):
 
 def build_daily_state(user, target=None):
     total = max(1, min(100, int(target or user.get("daily_target", DEFAULT_DAILY_TARGET))))
-    counts = distribute_daily_counts(total)
+    if STUDY_LANGUAGES[study_language(user)].get("verb_enabled"):
+        counts = distribute_daily_counts(total)
+    else:
+        counts = {"verb_form": 0, "flashcard": 0, "cloze": total}
     items = []
 
     for _ in range(counts["verb_form"]):
@@ -3600,7 +3662,8 @@ def decode_daily_state(value):
 def complete_daily(username):
     today = today_key()
     yesterday = (datetime.now(APP_TIMEZONE).date() - timedelta(days=1)).isoformat()
-    with get_db() as conn:
+    init_db(DB_PATH)
+    with get_runtime_db() as conn:
         row = conn.execute(
             """
             SELECT daily_streak, daily_last_completed, daily_vacation_mode
@@ -3639,7 +3702,8 @@ def daily_completed_today(user):
 
 
 def load_saved_daily_state(username):
-    with get_db() as conn:
+    init_db(DB_PATH)
+    with get_runtime_db() as conn:
         row = conn.execute(
             "SELECT daily_state_json FROM users WHERE name = ?",
             (username,),
@@ -3659,7 +3723,8 @@ def load_saved_daily_state(username):
 
 
 def save_daily_state(username, state):
-    with get_db() as conn:
+    init_db(DB_PATH)
+    with get_runtime_db() as conn:
         conn.execute(
             """
             UPDATE users
@@ -3671,7 +3736,8 @@ def save_daily_state(username, state):
 
 
 def clear_saved_daily_state(username):
-    with get_db() as conn:
+    init_db(DB_PATH)
+    with get_runtime_db() as conn:
         conn.execute(
             "UPDATE users SET daily_state_json = '' WHERE name = ?",
             (username,),
@@ -3695,13 +3761,28 @@ def daily_progress(username, user):
     }
 
 
-def update_daily_settings(username, target, vacation_mode):
+def update_daily_settings(username, target, vacation_mode, language=None):
     try:
         target_value = int(target)
     except (TypeError, ValueError):
         target_value = DEFAULT_DAILY_TARGET
     target_value = max(3, min(100, target_value))
-    with get_db() as conn:
+    language_value = language if language in STUDY_LANGUAGES else None
+    init_db(DB_PATH)
+    with get_runtime_db() as conn:
+        if language_value:
+            conn.execute(
+                """
+                UPDATE users
+                SET daily_target = ?,
+                    daily_vacation_mode = ?,
+                    study_language = ?,
+                    daily_state_json = ''
+                WHERE name = ?
+                """,
+                (target_value, 1 if vacation_mode else 0, language_value, username),
+            )
+            return
         conn.execute(
             """
             UPDATE users
@@ -3762,10 +3843,12 @@ def render_nav(username, user, active=""):
     links = [
         ('href="/"', "メニュー"),
         ('href="/daily"', "今日の練習"),
-        ('href="/verbs"', "動詞練習"),
         ('href="/flashcards"', "単語カード"),
         ('href="/cloze"', "穴埋め"),
+        ('href="/settings"', "設定"),
     ]
+    if STUDY_LANGUAGES[study_language(user)].get("verb_enabled"):
+        links.insert(2, ('href="/verbs"', "動詞練習"))
     link_html = "".join(
         f'<a {attrs} class="{"active" if label == active else ""}">{label}</a>'
         for attrs, label in links
@@ -4702,6 +4785,17 @@ def render_menu(username, user):
             <input type="number" name="daily_target" min="3" max="100" value="{daily_target}" />
           </label>
           <label>
+            学習する言語
+            <select name="study_language">{language_options}</select>
+          </label>
+          <label>
+            学習する言語
+            <select name="study_language">{language_options}</select>
+          </label>
+          <label>
+            <select name="study_language">{language_options}</select>
+          </label>
+          <label>
             <input type="checkbox" name="daily_vacation_mode" value="1" {vacation_checked} />
             休暇モード
           </label>
@@ -4732,6 +4826,15 @@ def render_menu(username, user):
     progress = daily_progress(username, user)
     daily_streak = int(user.get("daily_streak", 0))
     daily_target = int(user.get("daily_target", DEFAULT_DAILY_TARGET))
+    language_info = STUDY_LANGUAGES[study_language(user)]
+    verb_card = (
+        f'''<a class="game" href="/verbs">
+          <h2>動詞練習</h2>
+          <p>{escape(language_info["short"])}の動詞活用を入力して練習します。</p>
+        </a>'''
+        if language_info.get("verb_enabled")
+        else ""
+    )
 
     if progress["status"] == "completed":
         daily_text = "今日の練習は完了しました。次の日まで待ってください。"
@@ -4866,17 +4969,14 @@ def render_menu(username, user):
         {daily_action}
       </section>
       <section class="games">
-        <a class="game" href="/verbs">
-          <h2>動詞練習</h2>
-          <p>イタリア語の動詞活用を入力して練習します。</p>
-        </a>
+        {verb_card}
         <a class="game" href="/flashcards">
           <h2>単語カード</h2>
-          <p>イタリア語の単語を見て、日本語の意味を選びます。</p>
+          <p>{escape(language_info["flashcard_description"])}</p>
         </a>
         <a class="game" href="/cloze">
           <h2>穴埋め</h2>
-          <p>イタリア語の文の空欄に入る単語を入力します。下に日本語訳が表示されます。</p>
+          <p>{escape(language_info["cloze_description"])}</p>
         </a>
       </section>
     </main>
@@ -4888,6 +4988,11 @@ def render_settings(username, user):
     nav_html = render_nav(username, user, "設定")
     daily_target = int(user.get("daily_target", DEFAULT_DAILY_TARGET))
     vacation_checked = "checked" if user.get("daily_vacation_mode") else ""
+    current_language = study_language(user)
+    language_options = "".join(
+        f'<option value="{escape(key)}" {"selected" if key == current_language else ""}>{escape(info["label"])}</option>'
+        for key, info in STUDY_LANGUAGES.items()
+    )
     return f"""<!doctype html>
 <html lang="ja">
   <head>
@@ -4949,10 +5054,10 @@ def render_settings(username, user):
         font-size: 14px;
         margin: 0 0 14px;
       }}
-      input[type="number"] {{
+      input[type="number"], select {{
         display: block;
         margin-top: 6px;
-        width: 96px;
+        width: min(280px, 100%);
         padding: 10px 12px;
         border: 1px solid #d8d0c4;
         border-radius: 8px;
@@ -4994,6 +5099,10 @@ def render_settings(username, user):
             <input type="number" name="daily_target" min="3" max="100" value="{daily_target}" />
           </label>
           <label>
+            学習する言語
+            <select name="study_language">{language_options}</select>
+          </label>
+          <label>
             <input type="checkbox" name="daily_vacation_mode" value="1" {vacation_checked} />
             休暇モード
           </label>
@@ -5022,6 +5131,11 @@ def render_settings(username, user):
     nav_html = render_nav(username, user, "設定")
     daily_target = int(user.get("daily_target", DEFAULT_DAILY_TARGET))
     vacation_checked = "checked" if user.get("daily_vacation_mode") else ""
+    current_language = study_language(user)
+    language_options = "".join(
+        f'<option value="{escape(key)}" {"selected" if key == current_language else ""}>{escape(info["label"])}</option>'
+        for key, info in STUDY_LANGUAGES.items()
+    )
     return f"""<!doctype html>
 <html lang="ja">
   <head>
@@ -5131,6 +5245,10 @@ def render_settings(username, user):
           <label>
             今日の練習の問題数
             <input type="number" name="daily_target" min="3" max="100" value="{daily_target}" />
+          </label>
+          <label>
+            学習する言語
+            <select name="study_language">{language_options}</select>
           </label>
           <label>
             <input type="checkbox" name="daily_vacation_mode" value="1" {vacation_checked} />
@@ -7020,6 +7138,7 @@ def application(environ, start_response):
         body = render_login()
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [body.encode("utf-8")]
+    set_active_material_language(user)
 
     if user.get("password_reset_required"):
         if path == "/set-password" and environ.get("REQUEST_METHOD") == "POST":
@@ -7455,6 +7574,7 @@ def application(environ, start_response):
                 username,
                 form.get("daily_target", DEFAULT_DAILY_TARGET),
                 form.get("daily_vacation_mode") == "1",
+                form.get("study_language"),
             )
             return redirect(start_response, "/settings")
         body = render_settings(username, user)
@@ -7472,6 +7592,7 @@ def application(environ, start_response):
             username,
             form.get("daily_target", DEFAULT_DAILY_TARGET),
             form.get("daily_vacation_mode") == "1",
+            form.get("study_language"),
         )
         return redirect(start_response, "/")
 
@@ -7605,6 +7726,9 @@ def application(environ, start_response):
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [body.encode("utf-8")]
 
+    if path.startswith("/verbs") and not STUDY_LANGUAGES[study_language(user)].get("verb_enabled"):
+        return redirect(start_response, "/")
+
     if path == "/verbs" and environ.get("REQUEST_METHOD") == "POST":
         form = parse_post(environ)
         state = decode_state(form.get("state", ""))
@@ -7666,3 +7790,4 @@ if __name__ == "__main__":
     with make_server("0.0.0.0", 8000, application) as httpd:
         print("Serving on http://127.0.0.1:8000")
         httpd.serve_forever()
+
