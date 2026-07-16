@@ -1,1 +1,2 @@
 gunicorn
+verbecc==2.0.2

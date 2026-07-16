@@ -11,9 +11,11 @@ import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
+from http.cookiejar import CookieJar
 from html import escape, unescape
-from urllib.parse import parse_qs, urljoin
-from urllib.request import Request, urlopen, urlretrieve
+from urllib.parse import parse_qs, quote_plus, urljoin
+from urllib.error import HTTPError
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data", "verbs")
@@ -23,46 +25,35 @@ DB_PATH = os.environ.get(
     os.path.join(os.path.dirname(__file__), "data", "verbi.db"),
 )
 DB_DIR = os.path.dirname(DB_PATH) or os.path.join(os.path.dirname(__file__), "data")
-UNIMORPH_ITA_URL = "https://raw.githubusercontent.com/unimorph/ita/master/ita"
-UNIMORPH_CACHE_PATH = os.environ.get(
-    "UNIMORPH_ITA_PATH",
-    os.path.join(DB_DIR, "unimorph_ita.tsv"),
-)
 TOTAL_QUESTIONS = 10
 DEFAULT_DAILY_TARGET = 20
 DEFAULT_ELO = 1200
 ELO_K = 32
-NEW_CONTENT_CHANCE = 0.08
+NEW_CONTENT_CHANCE = 0.10
 SCRAPER_DEFAULT_SOURCES = [
+    "https://tatoeba.org/en/api_v0/search?query={query}&from=ita",
+    "https://it.wikisource.org/wiki/Novelle_per_un_anno",
+    "https://it.wikisource.org/wiki/Il_fu_Mattia_Pascal",
     "https://www.galileonet.it/feed/",
-    "https://www.linkiesta.it/feed/",
     "https://www.doppiozero.com/rss.xml",
-    "https://www.lavoce.info/feed/",
-    "https://www.valigiablu.it/feed/",
-    "https://www.ilpost.it/feed/",
+    "https://www.iltascabile.com/feed/",
 ]
 SCRAPER_SOURCE_LIBRARY = [
+    ("Tatoeba", "didattico", "https://tatoeba.org/en/api_v0/search?query={query}&from=ita"),
+    ("Tatoeba + Japanese", "didattico/traduzioni", "https://tatoeba.org/en/api_v0/search?query={query}&from=ita&to=jpn"),
+    ("Wikisource - Novelle per un anno", "storie/libri", "https://it.wikisource.org/wiki/Novelle_per_un_anno"),
+    ("Wikisource - Il fu Mattia Pascal", "storie/libri", "https://it.wikisource.org/wiki/Il_fu_Mattia_Pascal"),
+    ("Project Gutenberg - Italiano", "libri", "https://www.gutenberg.org/browse/languages/it"),
+    ("Il Tascabile", "cultura/saggi", "https://www.iltascabile.com/feed/"),
+    ("Doppiozero", "cultura/saggi", "https://www.doppiozero.com/rss.xml"),
+    ("Rivista Studio", "blog/cultura", "https://www.rivistastudio.com/feed/"),
+    ("Giap", "blog/storie", "https://www.wumingfoundation.com/giap/feed/"),
+    ("Valigia Blu", "blog/analisi", "https://www.valigiablu.it/feed/"),
     ("Galileo", "scienza", "https://www.galileonet.it/feed/"),
-    ("Scienza in rete", "scienza e societa", "https://www.scienzainrete.it/feed/"),
-    ("Le Scienze", "scienza", "https://www.lescienze.it/rss/"),
-    ("Geopop", "divulgazione", "https://www.geopop.it/feed/"),
-    ("Il Post", "attualita spiegata", "https://www.ilpost.it/feed/"),
-    ("Valigia Blu", "analisi", "https://www.valigiablu.it/feed/"),
-    ("Linkiesta", "analisi e attualita", "https://www.linkiesta.it/feed/"),
-    ("Lavoce.info", "economia", "https://www.lavoce.info/feed/"),
-    ("Doppiozero", "cultura", "https://www.doppiozero.com/rss.xml"),
-    ("Il Tascabile", "cultura e saggistica", "https://www.iltascabile.com/feed/"),
-    ("Rivista Studio", "cultura", "https://www.rivistastudio.com/feed/"),
-    ("Minima et Moralia", "letteratura", "https://www.minimaetmoralia.it/wp/feed/"),
-    ("Giap", "narrazione e societa", "https://www.wumingfoundation.com/giap/feed/"),
-    ("Treccani Magazine", "lingua e cultura", "https://www.treccani.it/magazine/rss.xml"),
-    ("Accademia della Crusca", "lingua italiana", "https://www.accademiadellacrusca.it/it/contenuti/rss.xml"),
-    ("Il Libraio", "libri", "https://www.illibraio.it/feed/"),
-    ("La Cucina Italiana", "cucina", "https://www.lacucinaitaliana.it/feed/rss"),
-    ("Gambero Rosso", "cucina", "https://www.gamberorosso.it/feed/"),
-    ("GreenMe", "ambiente", "https://www.greenme.it/feed/"),
-    ("Pagella Politica", "fact checking", "https://pagellapolitica.it/feed"),
     ("Open", "attualita", "https://www.open.online/feed/"),
+    ("Il Libraio", "libri", "https://www.illibraio.it/feed/"),
+    ("Gambero Rosso", "cucina", "https://www.gamberorosso.it/feed/"),
+    ("Pagella Politica", "fact checking", "https://pagellapolitica.it/feed"),
     ("ANSA", "notizie brevi", "https://www.ansa.it/sito/ansait_rss.xml"),
 ]
 SCRAPER_MAX_SOURCE_LINKS = 4
@@ -78,8 +69,8 @@ PERSON_SLOTS = [
     ("3", "PL", "loro"),
 ]
 SUPPORTED_TENSES = {
-    "presente": {"label": "presente", "features": {"V", "IND", "PRS"}},
-    "passato prossimo": {"label": "passato prossimo", "compound": True},
+    "presente": {"label": "presente", "verbecc_tense": "presente"},
+    "passato prossimo": {"label": "passato prossimo", "verbecc_tense": "passato-prossimo"},
 }
 TENSE_JA = {
     "presente": "現在",
@@ -93,6 +84,79 @@ GENDER_LABELS = {
 }
 ALL_GENDERS = list(GENDER_LABELS.keys())
 DB_INITIALIZED = False
+VERBECC_CONJUGATOR = None
+
+
+def stable_digest(*parts):
+    raw = "\x1f".join(str(part or "") for part in parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def make_question_uid(kind, prompt):
+    return f"q_{stable_digest('question', kind, prompt)[:24]}"
+
+
+def make_cloze_uid(sentence, answer):
+    return f"cloze_{stable_digest('cloze', sentence, answer)[:24]}"
+
+
+def question_content_hash(kind, prompt, answer):
+    return stable_digest("question-content", kind, prompt, answer)
+
+
+def cloze_content_hash(sentence, answer, translation):
+    return stable_digest("cloze-content", sentence, answer, translation)
+
+
+def migrate_content_identity(conn):
+    for table in ("questions", "cloze_questions"):
+        columns = {
+            row["name"]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if "uid" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN uid TEXT NOT NULL DEFAULT ''")
+        if "content_hash" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
+        if "revision" not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN revision INTEGER NOT NULL DEFAULT 1")
+
+    for row in conn.execute(
+        "SELECT id, kind, prompt, answer FROM questions WHERE uid = '' OR content_hash = ''"
+    ).fetchall():
+        conn.execute(
+            """
+            UPDATE questions
+            SET uid = CASE WHEN uid = '' THEN ? ELSE uid END,
+                content_hash = CASE WHEN content_hash = '' THEN ? ELSE content_hash END
+            WHERE id = ?
+            """,
+            (
+                make_question_uid(row["kind"], row["prompt"]),
+                question_content_hash(row["kind"], row["prompt"], row["answer"]),
+                row["id"],
+            ),
+        )
+
+    for row in conn.execute(
+        "SELECT id, sentence, answer, translation FROM cloze_questions WHERE uid = '' OR content_hash = ''"
+    ).fetchall():
+        conn.execute(
+            """
+            UPDATE cloze_questions
+            SET uid = CASE WHEN uid = '' THEN ? ELSE uid END,
+                content_hash = CASE WHEN content_hash = '' THEN ? ELSE content_hash END
+            WHERE id = ?
+            """,
+            (
+                make_cloze_uid(row["sentence"], row["answer"]),
+                cloze_content_hash(row["sentence"], row["answer"], row["translation"]),
+                row["id"],
+            ),
+        )
+
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_questions_uid ON questions(uid) WHERE uid <> ''")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cloze_questions_uid ON cloze_questions(uid) WHERE uid <> ''")
 CLOZE_EXAMPLES = [
     ("Io ____ italiano ogni giorno.", "studio", "私は毎日イタリア語を勉強します。"),
     ("Tu ____ un caffè al mattino.", "bevi", "君は朝にコーヒーを飲みます。"),
@@ -224,11 +288,14 @@ def init_db():
 
             CREATE TABLE IF NOT EXISTS questions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid TEXT NOT NULL DEFAULT '',
                 kind TEXT NOT NULL,
                 verb_id INTEGER NOT NULL REFERENCES verbs(id) ON DELETE CASCADE,
                 verb_form_id INTEGER REFERENCES verb_forms(id) ON DELETE CASCADE,
                 prompt TEXT NOT NULL,
                 answer TEXT NOT NULL,
+                content_hash TEXT NOT NULL DEFAULT '',
+                revision INTEGER NOT NULL DEFAULT 1,
                 elo INTEGER NOT NULL DEFAULT 1200,
                 active INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL DEFAULT 'approved',
@@ -243,6 +310,8 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
                 question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+                question_uid TEXT NOT NULL DEFAULT '',
+                question_revision INTEGER NOT NULL DEFAULT 1,
                 game TEXT NOT NULL,
                 correct INTEGER NOT NULL,
                 user_elo_before INTEGER NOT NULL,
@@ -254,9 +323,12 @@ def init_db():
 
             CREATE TABLE IF NOT EXISTS cloze_questions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid TEXT NOT NULL DEFAULT '',
                 sentence TEXT NOT NULL UNIQUE,
                 answer TEXT NOT NULL,
                 translation TEXT NOT NULL,
+                content_hash TEXT NOT NULL DEFAULT '',
+                revision INTEGER NOT NULL DEFAULT 1,
                 elo INTEGER NOT NULL DEFAULT 1200,
                 active INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL DEFAULT 'approved',
@@ -270,12 +342,26 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
                 cloze_question_id INTEGER NOT NULL REFERENCES cloze_questions(id) ON DELETE CASCADE,
+                cloze_question_uid TEXT NOT NULL DEFAULT '',
+                cloze_question_revision INTEGER NOT NULL DEFAULT 1,
                 correct INTEGER NOT NULL,
                 user_elo_before INTEGER NOT NULL,
                 user_elo_after INTEGER NOT NULL,
                 question_elo_before INTEGER NOT NULL,
                 question_elo_after INTEGER NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS user_card_state (
+                user_name TEXT NOT NULL REFERENCES users(name) ON DELETE CASCADE,
+                card_uid TEXT NOT NULL,
+                card_type TEXT NOT NULL,
+                first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                seen_count INTEGER NOT NULL DEFAULT 0,
+                correct_count INTEGER NOT NULL DEFAULT 0,
+                card_revision INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (user_name, card_uid)
             );
 
             CREATE TABLE IF NOT EXISTS pending_content (
@@ -318,12 +404,12 @@ def init_db():
                 attribution = excluded.attribution
             """,
             (
-                "unimorph-ita",
-                "UniMorph Italian",
-                "https://github.com/unimorph/ita",
-                "Creative Commons Attribution-ShareAlike 3.0",
-                "https://creativecommons.org/licenses/by-sa/3.0/",
-                "Italian morphological data from UniMorph Italian. UniMorph lists the source as Wikipedia.",
+                "verbecc",
+                "Verbecc",
+                "https://github.com/bretttolbert/verbecc",
+                "GNU Lesser General Public License v3.0",
+                "https://www.gnu.org/licenses/lgpl-3.0.html",
+                "Italian conjugation data and templates generated through Verbecc with ML prediction disabled.",
             ),
         )
 
@@ -366,6 +452,25 @@ def init_db():
             }
             if "source_id" not in columns:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN source_id INTEGER")
+
+        event_migrations = {
+            "practice_events": {
+                "question_uid": "TEXT NOT NULL DEFAULT ''",
+                "question_revision": "INTEGER NOT NULL DEFAULT 1",
+            },
+            "cloze_practice_events": {
+                "cloze_question_uid": "TEXT NOT NULL DEFAULT ''",
+                "cloze_question_revision": "INTEGER NOT NULL DEFAULT 1",
+            },
+        }
+        for table, migrations in event_migrations.items():
+            columns = {
+                row["name"]
+                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for column, definition in migrations.items():
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
         verb_count = conn.execute("SELECT COUNT(*) FROM verbs").fetchone()[0]
         if verb_count == 0:
@@ -437,6 +542,38 @@ def init_db():
                     for sentence, answer, translation in CLOZE_EXAMPLES
                 ],
             )
+
+        migrate_content_identity(conn)
+        conn.execute(
+            """
+            UPDATE practice_events
+            SET question_uid = (
+                    SELECT uid FROM questions WHERE questions.id = practice_events.question_id
+                ),
+                question_revision = (
+                    SELECT revision FROM questions WHERE questions.id = practice_events.question_id
+                )
+            WHERE question_uid = ''
+                AND EXISTS (
+                    SELECT 1 FROM questions WHERE questions.id = practice_events.question_id
+                )
+            """
+        )
+        conn.execute(
+            """
+            UPDATE cloze_practice_events
+            SET cloze_question_uid = (
+                    SELECT uid FROM cloze_questions WHERE cloze_questions.id = cloze_practice_events.cloze_question_id
+                ),
+                cloze_question_revision = (
+                    SELECT revision FROM cloze_questions WHERE cloze_questions.id = cloze_practice_events.cloze_question_id
+                )
+            WHERE cloze_question_uid = ''
+                AND EXISTS (
+                    SELECT 1 FROM cloze_questions WHERE cloze_questions.id = cloze_practice_events.cloze_question_id
+                )
+            """
+        )
 
         user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         if user_count == 0 and os.path.exists(USERS_PATH):
@@ -1507,7 +1644,7 @@ def load_approved_cards():
 
         rows = conn.execute(
             """
-            SELECT id, sentence, answer, translation, elo, is_new
+            SELECT id, uid, revision, sentence, answer, translation, elo, is_new
             FROM cloze_questions
             WHERE active = 1 AND status = 'approved'
             ORDER BY id DESC
@@ -1537,150 +1674,153 @@ def source_id_by_slug(conn, slug):
     return row["id"] if row else None
 
 
-def ensure_unimorph_cache():
-    if os.path.exists(UNIMORPH_CACHE_PATH) and os.path.getsize(UNIMORPH_CACHE_PATH) > 0:
-        return UNIMORPH_CACHE_PATH
-    cache_dir = os.path.dirname(UNIMORPH_CACHE_PATH)
-    if cache_dir:
-        os.makedirs(cache_dir, exist_ok=True)
+def get_verbecc_conjugator():
+    global VERBECC_CONJUGATOR
+    if VERBECC_CONJUGATOR is not None:
+        return VERBECC_CONJUGATOR
     try:
-        urlretrieve(UNIMORPH_ITA_URL, UNIMORPH_CACHE_PATH)
-    except Exception as exc:
-        raise RuntimeError(f"UniMorph Italian data could not be downloaded: {exc}") from exc
-    return UNIMORPH_CACHE_PATH
+        import verbecc
+        import verbecc.src.defs.types.data.verbs as verbs_mod
+    except ImportError as exc:
+        raise RuntimeError("Verbecc is not installed.") from exc
+    # Avoid Verbecc trying to train/write an ML fallback model at runtime.
+    verbs_mod.config.ENABLE_ML_PREDICTION = False
+    VERBECC_CONJUGATOR = verbecc.CompleteConjugator(verbecc.LangCodeISO639_1.it)
+    return VERBECC_CONJUGATOR
 
 
-def unimorph_slot_key(features):
-    person = None
-    number = None
-    for feature in features:
-        if feature in {"1", "2", "3"}:
-            person = feature
-        elif feature in {"SG", "PL"}:
-            number = feature
-    if person and number:
-        return person, number
-    return None
+def strip_verbecc_pronoun(value, pronoun):
+    value = value.strip()
+    prefix = f"{pronoun} "
+    if pronoun and value.startswith(prefix):
+        return value[len(prefix):].strip()
+    return value
 
 
-def lookup_unimorph_forms(infinitive, tense):
+def lookup_verbecc_forms(infinitive, tense):
     tense_info = SUPPORTED_TENSES.get(tense)
-    if not tense_info or "features" not in tense_info:
+    if not tense_info or "verbecc_tense" not in tense_info:
         raise ValueError("Unsupported tense.")
-    required = tense_info["features"]
-    forms = {}
-    path = ensure_unimorph_cache()
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) != 3 or parts[0] != infinitive:
+    conjugator = get_verbecc_conjugator()
+    try:
+        conjugation = conjugator.conjugate(infinitive)
+        rows = conjugation.get_data()["moods"]["indicativo"][tense_info["verbecc_tense"]]
+    except Exception as exc:
+        raise ValueError(f"Verbecc could not conjugate {infinitive} {tense}: {exc}") from exc
+    forms = []
+    seen = set()
+    for row in rows:
+        pronoun = row.get("pr", "")
+        person = row.get("p", "")
+        number = "SG" if row.get("n") == "s" else "PL" if row.get("n") == "p" else ""
+        gender = {"m": "masculine", "f": "feminine"}.get(row.get("g", ""), "")
+        for raw_value in row.get("c", []):
+            value = strip_verbecc_pronoun(raw_value, pronoun)
+            key = (pronoun, gender, value)
+            if not value or key in seen:
                 continue
-            features = set(parts[2].split(";"))
-            if not required.issubset(features):
-                continue
-            slot = unimorph_slot_key(features)
-            if slot and slot not in forms:
-                forms[slot] = parts[1]
-    missing = [
-        label
-        for person, number, label in PERSON_SLOTS
-        if (person, number) not in forms
-    ]
-    if missing:
-        raise ValueError(
-            f"UniMorph has no complete {tense} table for {infinitive}: missing {', '.join(missing)}."
-        )
-    return [
-        {
-            "person": person,
-            "number": number,
-            "pronoun": label,
-            "value": forms[(person, number)],
-        }
-        for person, number, label in PERSON_SLOTS
-    ]
+            seen.add(key)
+            forms.append(
+                {
+                    "person": person,
+                    "number": number,
+                    "pronoun": pronoun,
+                    "gender": gender,
+                    "value": value,
+                }
+            )
+    if not forms:
+        raise ValueError(f"Verbecc returned no {tense} forms for {infinitive}.")
+    return forms
 
 
-def import_unimorph_verb_tense(infinitive, ja, tense):
+def import_verbecc_verb_tense(infinitive, ja, tense):
     infinitive = infinitive.strip().lower()
     ja = ja.strip()
     tense = tense.strip()
     if not infinitive or not ja:
         return False, "Verb and translation are required."
     try:
-        forms = lookup_unimorph_forms(infinitive, tense)
+        forms = lookup_verbecc_forms(infinitive, tense)
     except (RuntimeError, ValueError) as exc:
         return False, str(exc)
     with get_db() as conn:
-        source_id = source_id_by_slug(conn, "unimorph-ita")
+        source_id = source_id_by_slug(conn, "verbecc")
         verb_id = find_or_create_verb(conn, infinitive, ja)
         conn.execute(
             "UPDATE verbs SET source_id = ? WHERE id = ?",
             (source_id, verb_id),
         )
+        seen_form_ids = []
         for form in forms:
             pronoun = form["pronoun"]
             value = form["value"]
-            pronouns = [pronoun]
-            if pronoun == "lui/lei":
-                existing_third_person = conn.execute(
-                    """
-                    SELECT pronoun
-                    FROM verb_forms
-                    WHERE verb_id = ?
-                        AND tense = ?
-                        AND gender = ''
-                        AND pronoun IN ('lui', 'lei')
-                    """,
-                    (verb_id, tense),
-                ).fetchall()
-                if existing_third_person:
-                    pronouns = [row["pronoun"] for row in existing_third_person]
-            for target_pronoun in pronouns:
-                form_row = conn.execute(
-                    """
-                    SELECT id FROM verb_forms
-                    WHERE verb_id = ? AND tense = ? AND pronoun = ? AND gender = ''
-                    """,
-                    (verb_id, tense, target_pronoun),
-                ).fetchone()
-                if form_row:
-                    form_id = form_row["id"]
-                    conn.execute(
-                        """
-                        UPDATE verb_forms
-                        SET value = ?, source_id = ?
-                        WHERE id = ?
-                        """,
-                        (value, source_id, form_id),
-                    )
-                else:
-                    cursor = conn.execute(
-                        """
-                        INSERT INTO verb_forms
-                            (verb_id, tense, pronoun, value, gender, source_id)
-                        VALUES (?, ?, ?, ?, '', ?)
-                        """,
-                        (verb_id, tense, target_pronoun, value, source_id),
-                    )
-                    form_id = cursor.lastrowid
-                prompt = f"{infinitive}|{ja}|{tense}|{target_pronoun}|"
+            gender = form.get("gender", "")
+            form_row = conn.execute(
+                """
+                SELECT id FROM verb_forms
+                WHERE verb_id = ? AND tense = ? AND pronoun = ? AND gender = ?
+                """,
+                (verb_id, tense, pronoun, gender),
+            )
+            form_row = form_row.fetchone()
+            if form_row:
+                form_id = form_row["id"]
                 conn.execute(
                     """
-                    INSERT INTO questions
-                        (kind, verb_id, verb_form_id, prompt, answer, elo, active, status, is_new, source_id)
-                    VALUES ('verb_form', ?, ?, ?, ?, ?, 1, 'approved', 1, ?)
-                    ON CONFLICT(kind, verb_id, verb_form_id) DO UPDATE SET
-                        prompt = excluded.prompt,
-                        answer = excluded.answer,
-                        active = 1,
-                        status = 'approved',
-                        is_new = 1,
-                        source_id = excluded.source_id
+                    UPDATE verb_forms
+                    SET value = ?, source_id = ?
+                    WHERE id = ?
                     """,
-                    (verb_id, form_id, prompt, value, DEFAULT_ELO, source_id),
+                    (value, source_id, form_id),
                 )
-    return True, f"Imported {infinitive} {tense} from UniMorph."
+            else:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO verb_forms
+                        (verb_id, tense, pronoun, value, gender, source_id)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (verb_id, tense, pronoun, value, gender, source_id),
+                )
+                form_id = cursor.lastrowid
+            seen_form_ids.append(form_id)
+            prompt = f"{infinitive}|{ja}|{tense}|{pronoun}|{gender}"
+            uid = make_question_uid("verb_form", prompt)
+            content_hash = question_content_hash("verb_form", prompt, value)
+            conn.execute(
+                """
+                INSERT INTO questions
+                    (uid, kind, verb_id, verb_form_id, prompt, answer, content_hash, revision, elo, active, status, is_new, source_id)
+                VALUES (?, 'verb_form', ?, ?, ?, ?, ?, 1, ?, 1, 'approved', 1, ?)
+                ON CONFLICT(kind, verb_id, verb_form_id) DO UPDATE SET
+                    prompt = excluded.prompt,
+                    answer = excluded.answer,
+                    revision = CASE WHEN questions.content_hash <> excluded.content_hash THEN questions.revision + 1 ELSE questions.revision END,
+                    content_hash = excluded.content_hash,
+                    active = 1,
+                    status = 'approved',
+                    is_new = 1,
+                    source_id = excluded.source_id
+                """,
+                (uid, verb_id, form_id, prompt, value, content_hash, DEFAULT_ELO, source_id),
+            )
+        if seen_form_ids:
+            placeholders = ",".join("?" for _ in seen_form_ids)
+            conn.execute(
+                f"""
+                UPDATE questions
+                SET active = 0
+                WHERE kind = 'verb_form'
+                    AND verb_id = ?
+                    AND verb_form_id IN (
+                        SELECT id FROM verb_forms
+                        WHERE verb_id = ? AND tense = ? AND id NOT IN ({placeholders})
+                    )
+                """,
+                (verb_id, verb_id, tense, *seen_form_ids),
+            )
+    return True, f"Imported {infinitive} {tense} from Verbecc."
 
 
 def load_verb_trees():
@@ -1695,6 +1835,7 @@ def load_verb_trees():
                 v.ja,
                 vf.tense,
                 vf.pronoun,
+                vf.gender,
                 vf.value,
                 q.id AS question_id,
                 q.elo,
@@ -1724,6 +1865,7 @@ def load_verb_trees():
         tense.append(
             {
                 "pronoun": row["pronoun"],
+                "gender": row["gender"] or "",
                 "value": row["value"],
                 "question_id": row["question_id"],
                 "elo": row["elo"],
@@ -2260,7 +2402,6 @@ def tense_options(selected="presente"):
     return "".join(
         f'<option value="{escape(key)}" {"selected" if key == selected else ""}>{escape(info["label"])}</option>'
         for key, info in SUPPORTED_TENSES.items()
-        if "features" in info
     )
 
 
@@ -2270,7 +2411,7 @@ def render_tense_import_form():
         <input name="infinitive" placeholder="andare" autocomplete="off" required />
         <input name="ja" placeholder="行く" autocomplete="off" required />
         <select name="tense">{tense_options()}</select>
-        <button title="Import from UniMorph" aria-label="Import from UniMorph" type="submit">&#128190;</button>
+        <button title="Import from Verbecc" aria-label="Import from Verbecc" type="submit">&#128190;</button>
       </form>
     """
 
@@ -2293,9 +2434,12 @@ def render_verb_trees():
             rows = []
             for item in ordered:
                 new_badge = '<span class="status-new">NEW</span>' if item["is_new"] else ""
+                pronoun_label = item["pronoun"]
+                if item.get("gender"):
+                    pronoun_label = f'{pronoun_label} ({item["gender"]})'
                 rows.append(
                     '<div class="conj-row">'
-                    f'<div class="pronoun-cell">{escape(item["pronoun"])}</div>'
+                    f'<div class="pronoun-cell">{escape(pronoun_label)}</div>'
                     f'<div class="form-cell">{escape(item["value"])}</div>'
                     f'<div class="elo-cell">ELO {int(item["elo"])} {new_badge}</div>'
                     '</div>'
@@ -2664,13 +2808,15 @@ def approve_pending_content(conn, row, username):
         translation = payload.get("translation", "").strip()
         if not sentence or not answer or not translation:
             return False, "候補の内容が足りません。"
+        uid = make_cloze_uid(sentence, answer)
+        content_hash = cloze_content_hash(sentence, answer, translation)
         conn.execute(
             """
             INSERT OR IGNORE INTO cloze_questions
-                (sentence, answer, translation, elo, active, status, is_new)
-            VALUES (?, ?, ?, ?, 1, 'approved', 1)
+                (uid, sentence, answer, translation, content_hash, revision, elo, active, status, is_new)
+            VALUES (?, ?, ?, ?, ?, 1, ?, 1, 'approved', 1)
             """,
-            (sentence, answer, translation, DEFAULT_ELO),
+            (uid, sentence, answer, translation, content_hash, DEFAULT_ELO),
         )
     elif content_type == "flashcard":
         infinitive = (payload.get("infinitive") or payload.get("word") or "").strip()
@@ -2678,13 +2824,15 @@ def approve_pending_content(conn, row, username):
         if not infinitive or not ja:
             return False, "候補の内容が足りません。"
         verb_id = find_or_create_verb(conn, infinitive, ja)
+        uid = make_question_uid("flashcard", infinitive)
+        content_hash = question_content_hash("flashcard", infinitive, ja)
         conn.execute(
             """
             INSERT OR IGNORE INTO questions
-                (kind, verb_id, verb_form_id, prompt, answer, elo, active, status, is_new)
-            VALUES ('flashcard', ?, NULL, ?, ?, ?, 1, 'approved', 1)
+                (uid, kind, verb_id, verb_form_id, prompt, answer, content_hash, revision, elo, active, status, is_new)
+            VALUES (?, 'flashcard', ?, NULL, ?, ?, ?, 1, ?, 1, 'approved', 1)
             """,
-            (verb_id, infinitive, ja, DEFAULT_ELO),
+            (uid, verb_id, infinitive, ja, content_hash, DEFAULT_ELO),
         )
     elif content_type == "verb_form":
         infinitive = (payload.get("infinitive") or payload.get("word") or "").strip()
@@ -2719,13 +2867,15 @@ def approve_pending_content(conn, row, username):
             )
             form_id = cursor.lastrowid
         prompt = f"{infinitive}|{ja}|{tense}|{pronoun}|{gender}"
+        uid = make_question_uid("verb_form", prompt)
+        content_hash = question_content_hash("verb_form", prompt, answer)
         conn.execute(
             """
             INSERT OR IGNORE INTO questions
-                (kind, verb_id, verb_form_id, prompt, answer, elo, active, status, is_new)
-            VALUES ('verb_form', ?, ?, ?, ?, ?, 1, 'approved', 1)
+                (uid, kind, verb_id, verb_form_id, prompt, answer, content_hash, revision, elo, active, status, is_new)
+            VALUES (?, 'verb_form', ?, ?, ?, ?, ?, 1, ?, 1, 'approved', 1)
             """,
-            (verb_id, form_id, prompt, answer, DEFAULT_ELO),
+            (uid, verb_id, form_id, prompt, answer, content_hash, DEFAULT_ELO),
         )
     else:
         return False, "未対応の種類です。"
@@ -2748,16 +2898,26 @@ def update_approved_card(form):
     card_id = form.get("id", "")
     with get_db() as conn:
         if card_type == "cloze":
+            sentence = form.get("sentence", "").strip()
+            answer = form.get("answer", "").strip()
+            translation = form.get("translation", "").strip()
+            new_hash = cloze_content_hash(sentence, answer, translation)
             conn.execute(
                 """
                 UPDATE cloze_questions
-                SET sentence = ?, answer = ?, translation = ?
+                SET sentence = ?,
+                    answer = ?,
+                    translation = ?,
+                    revision = CASE WHEN content_hash <> ? THEN revision + 1 ELSE revision END,
+                    content_hash = ?
                 WHERE id = ?
                 """,
                 (
-                    form.get("sentence", "").strip(),
-                    form.get("answer", "").strip(),
-                    form.get("translation", "").strip(),
+                    sentence,
+                    answer,
+                    translation,
+                    new_hash,
+                    new_hash,
                     card_id,
                 ),
             )
@@ -2780,13 +2940,17 @@ def update_approved_card(form):
             (infinitive, ja, row["verb_id"]),
         )
         if card_type == "flashcard":
+            new_hash = question_content_hash("flashcard", infinitive, ja)
             conn.execute(
                 """
                 UPDATE questions
-                SET prompt = ?, answer = ?
+                SET prompt = ?,
+                    answer = ?,
+                    revision = CASE WHEN content_hash <> ? THEN revision + 1 ELSE revision END,
+                    content_hash = ?
                 WHERE id = ?
                 """,
-                (infinitive, ja, card_id),
+                (infinitive, ja, new_hash, new_hash, card_id),
             )
         elif card_type == "verb_form":
             tense = form.get("tense", "").strip()
@@ -2802,9 +2966,17 @@ def update_approved_card(form):
                 (tense, pronoun, gender, answer, row["verb_form_id"]),
             )
             prompt = f"{infinitive}|{ja}|{tense}|{pronoun}|{gender}"
+            new_hash = question_content_hash("verb_form", prompt, answer)
             conn.execute(
-                "UPDATE questions SET prompt = ?, answer = ? WHERE id = ?",
-                (prompt, answer, card_id),
+                """
+                UPDATE questions
+                SET prompt = ?,
+                    answer = ?,
+                    revision = CASE WHEN content_hash <> ? THEN revision + 1 ELSE revision END,
+                    content_hash = ?
+                WHERE id = ?
+                """,
+                (prompt, answer, new_hash, new_hash, card_id),
             )
         else:
             return False
@@ -2924,6 +3096,22 @@ def expected_score(player_elo, question_elo):
     return 1 / (1 + 10 ** ((question_elo - player_elo) / 400))
 
 
+def record_user_card_seen(conn, username, card_uid, card_type, revision, correct):
+    conn.execute(
+        """
+        INSERT INTO user_card_state
+            (user_name, card_uid, card_type, seen_count, correct_count, card_revision)
+        VALUES (?, ?, ?, 1, ?, ?)
+        ON CONFLICT(user_name, card_uid) DO UPDATE SET
+            last_seen = CURRENT_TIMESTAMP,
+            seen_count = seen_count + 1,
+            correct_count = correct_count + excluded.correct_count,
+            card_revision = excluded.card_revision
+        """,
+        (username, card_uid, card_type, 1 if correct else 0, revision),
+    )
+
+
 def update_elo(username, question_id, correct, game):
     init_db()
     with get_db() as conn:
@@ -2931,7 +3119,7 @@ def update_elo(username, question_id, correct, game):
             "SELECT elo FROM users WHERE name = ?", (username,)
         ).fetchone()
         question_row = conn.execute(
-            "SELECT elo FROM questions WHERE id = ?", (question_id,)
+            "SELECT elo, uid, revision FROM questions WHERE id = ?", (question_id,)
         ).fetchone()
         if not user_row or not question_row:
             return None
@@ -2954,12 +3142,22 @@ def update_elo(username, question_id, correct, game):
             "UPDATE questions SET elo = ? WHERE id = ?",
             (question_after, question_id),
         )
+        record_user_card_seen(
+            conn,
+            username,
+            question_row["uid"],
+            game,
+            int(question_row["revision"]),
+            bool(correct),
+        )
         conn.execute(
             """
             INSERT INTO practice_events
                 (
                     user_name,
                     question_id,
+                    question_uid,
+                    question_revision,
                     game,
                     correct,
                     user_elo_before,
@@ -2967,11 +3165,13 @@ def update_elo(username, question_id, correct, game):
                     question_elo_before,
                     question_elo_after
                 )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 username,
                 question_id,
+                question_row["uid"],
+                int(question_row["revision"]),
                 game,
                 actual,
                 user_before,
@@ -2995,7 +3195,7 @@ def update_cloze_elo(username, question_id, correct):
             "SELECT elo FROM users WHERE name = ?", (username,)
         ).fetchone()
         question_row = conn.execute(
-            "SELECT elo FROM cloze_questions WHERE id = ?", (question_id,)
+            "SELECT elo, uid, revision FROM cloze_questions WHERE id = ?", (question_id,)
         ).fetchone()
         if not user_row or not question_row:
             return None
@@ -3016,23 +3216,35 @@ def update_cloze_elo(username, question_id, correct):
             "UPDATE cloze_questions SET elo = ? WHERE id = ?",
             (question_after, question_id),
         )
+        record_user_card_seen(
+            conn,
+            username,
+            question_row["uid"],
+            "cloze",
+            int(question_row["revision"]),
+            bool(correct),
+        )
         conn.execute(
             """
             INSERT INTO cloze_practice_events
                 (
                     user_name,
                     cloze_question_id,
+                    cloze_question_uid,
+                    cloze_question_revision,
                     correct,
                     user_elo_before,
                     user_elo_after,
                     question_elo_before,
                     question_elo_after
                 )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 username,
                 question_id,
+                question_row["uid"],
+                int(question_row["revision"]),
                 actual,
                 user_before,
                 user_after,
@@ -3064,6 +3276,33 @@ def weighted_row_by_elo(rows, user_elo):
     return random.choices(rows, weights=weights, k=1)[0]
 
 
+def user_seen_card_uids(conn, username, card_type):
+    return {
+        row["card_uid"]
+        for row in conn.execute(
+            """
+            SELECT card_uid
+            FROM user_card_state
+            WHERE user_name = ? AND card_type = ?
+            """,
+            (username, card_type),
+        ).fetchall()
+    }
+
+
+def choose_user_card_subset(rows, conn, user, card_type, force_new):
+    rows = list(rows)
+    if not rows:
+        return rows
+    seen = user_seen_card_uids(conn, user.get("name", ""), card_type)
+    if force_new:
+        unseen_rows = [row for row in rows if row["uid"] not in seen]
+        if unseen_rows:
+            return unseen_rows
+    seen_rows = [row for row in rows if row["uid"] in seen]
+    return seen_rows or rows
+
+
 def weighted_question_row(user, kind):
     init_db()
     user_elo = int(user.get("elo", DEFAULT_ELO))
@@ -3085,9 +3324,8 @@ def weighted_question_row(user, kind):
                         AND q.kind = 'flashcard'
                         AND q.active = 1
                         AND q.status = 'approved'
-                        AND (? = 0 OR q.is_new = 1)
                     """,
-                    (user["name"], 1 if force_new else 0),
+                    (user["name"],),
                 ).fetchall()
             else:
                 rows = conn.execute(
@@ -3098,13 +3336,9 @@ def weighted_question_row(user, kind):
                     WHERE q.kind = 'flashcard'
                         AND q.active = 1
                         AND q.status = 'approved'
-                        AND (? = 0 OR q.is_new = 1)
                     """
-                    ,
-                    (1 if force_new else 0,),
                 ).fetchall()
-            if force_new and not rows:
-                return weighted_question_row(user, kind)
+            rows = choose_user_card_subset(rows, conn, user, "flashcard", force_new)
         else:
             force_new = random.random() < NEW_CONTENT_CHANCE
             rows = conn.execute(
@@ -3122,13 +3356,9 @@ def weighted_question_row(user, kind):
                 WHERE q.kind = 'verb_form'
                     AND q.active = 1
                     AND q.status = 'approved'
-                    AND (? = 0 OR q.is_new = 1)
                 """
-                ,
-                (1 if force_new else 0,),
             ).fetchall()
-            if force_new and not rows:
-                return weighted_question_row(user, kind)
+            rows = choose_user_card_subset(rows, conn, user, "verb_form", force_new)
 
     return weighted_row_by_elo(rows, user_elo)
 
@@ -3142,21 +3372,20 @@ def pick_cloze_question(user):
     with get_db() as conn:
         rows = conn.execute(
             """
-            SELECT id, sentence, answer, translation, elo, is_new
+            SELECT id, uid, revision, sentence, answer, translation, elo, is_new
             FROM cloze_questions
             WHERE active = 1
                 AND status = 'approved'
-                AND (? = 0 OR is_new = 1)
             """,
-            (1 if force_new else 0,),
         ).fetchall()
-    if force_new and not rows:
-        return pick_cloze_question({**user, "_skip_new": True})
+        rows = choose_user_card_subset(rows, conn, user, "cloze", force_new)
     row = weighted_row_by_elo(rows, int(user.get("elo", DEFAULT_ELO)))
     if not row:
         return None
     return {
         "question_id": row["id"],
+        "card_uid": row["uid"],
+        "card_revision": int(row["revision"]),
         "sentence": row["sentence"],
         "answer": row["answer"],
         "translation": row["translation"],
@@ -3170,6 +3399,8 @@ def pick_question(user=None):
     if row:
         return {
             "question_id": row["id"],
+            "card_uid": row["uid"],
+            "card_revision": int(row["revision"]),
             "question_elo": row["elo"],
             "is_new": bool(row["is_new"]),
             "infinitive": row["infinitive"],
@@ -3227,6 +3458,8 @@ def pick_flashcard(user):
     if row:
         card = {
             "question_id": row["id"],
+            "card_uid": row["uid"],
+            "card_revision": int(row["revision"]),
             "question_elo": row["elo"],
             "is_new": bool(row["is_new"]),
             "word": row["infinitive"],
@@ -3273,12 +3506,12 @@ def today_key():
 
 
 def distribute_daily_counts(total):
-    games = ["verb_form", "flashcard", "cloze"]
-    base = total // len(games)
-    remainder = total % len(games)
+    verb_count = max(1, round(total * 0.25)) if total > 1 else total
+    cloze_count = max(0, total - verb_count)
     return {
-        game: base + (1 if index < remainder else 0)
-        for index, game in enumerate(games)
+        "verb_form": verb_count,
+        "flashcard": 0,
+        "cloze": cloze_count,
     }
 
 
@@ -3293,6 +3526,8 @@ def build_daily_state(user, target=None):
             {
                 "game": "verb_form",
                 "question_id": question.get("question_id", ""),
+                "card_uid": question.get("card_uid", ""),
+                "card_revision": int(question.get("card_revision", 1)),
                 "question_elo": int(question.get("question_elo", DEFAULT_ELO)),
                 "is_new": bool(question.get("is_new")),
                 "infinitive": question["infinitive"],
@@ -3310,6 +3545,8 @@ def build_daily_state(user, target=None):
             {
                 "game": "flashcard",
                 "question_id": card.get("question_id", ""),
+                "card_uid": card.get("card_uid", ""),
+                "card_revision": int(card.get("card_revision", 1)),
                 "question_elo": int(card.get("question_elo", DEFAULT_ELO)),
                 "is_new": bool(card.get("is_new")),
                 "word": card["word"],
@@ -3326,6 +3563,8 @@ def build_daily_state(user, target=None):
             {
                 "game": "cloze",
                 "question_id": question.get("question_id", ""),
+                "card_uid": question.get("card_uid", ""),
+                "card_revision": int(question.get("card_revision", 1)),
                 "question_elo": int(question.get("question_elo", DEFAULT_ELO)),
                 "is_new": bool(question.get("is_new")),
                 "sentence": question["sentence"],
@@ -5336,18 +5575,42 @@ def render_cloze(username, user, question, result=None):
 </html>"""
 
 
-def fetch_url_text(url):
+SCRAPER_BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.7,en;q=0.6",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+def browser_like_headers(url, referer=""):
+    headers = dict(SCRAPER_BROWSER_HEADERS)
+    if referer:
+        headers["Referer"] = referer
+    return headers
+
+
+def fetch_url_text(url, opener=None, referer=""):
+    opener = opener or build_opener(HTTPCookieProcessor(CookieJar()))
     request = Request(
         url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; VerbiSentencePrep/1.0)",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        },
+        headers=browser_like_headers(url, referer=referer),
     )
-    with urlopen(request, timeout=SCRAPER_TIMEOUT_SECONDS) as response:
+    with opener.open(request, timeout=SCRAPER_TIMEOUT_SECONDS) as response:
         content_type = response.headers.get_content_charset() or "utf-8"
         raw = response.read(1_500_000)
     return raw.decode(content_type, errors="replace")
+
+
+def site_root(url):
+    match = re.match(r"^(https?://[^/]+)/?", url)
+    return match.group(1) + "/" if match else url
 
 
 def html_to_text(raw):
@@ -5374,13 +5637,82 @@ def extract_links(raw, base_url):
     return deduped[:SCRAPER_MAX_SOURCE_LINKS]
 
 
-def sentence_candidates(text):
+def sentence_candidates(text, min_chars=0, max_chars=320):
     # Intentionally simple first pass: keep spans between full stops.
     return [
         part.strip()
         for part in text.split(".")
-        if 35 <= len(part.strip()) <= 320
+        if part.strip() and min_chars <= len(part.strip()) <= max_chars
     ]
+
+
+def content_sentence_items(raw, url, min_chars=0, max_chars=320):
+    stripped = raw.lstrip()
+    if "tatoeba.org/" in url and stripped.startswith("{"):
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError:
+            return [
+                {"sentence": sentence, "translation": ""}
+                for sentence in sentence_candidates(html_to_text(raw), min_chars=min_chars, max_chars=max_chars)
+            ]
+        items = []
+        for row in data.get("results", []):
+            text = str(row.get("text", "")).strip()
+            if min_chars <= len(text) <= max_chars:
+                translations = []
+                for group in row.get("translations", []):
+                    for translation in group:
+                        if translation.get("lang") == "jpn" and translation.get("text"):
+                            translations.append(str(translation["text"]).strip())
+                items.append(
+                    {
+                        "sentence": text.rstrip("."),
+                        "translation": translations[0] if translations else "",
+                    }
+                )
+        return items
+    return [
+        {"sentence": sentence, "translation": ""}
+        for sentence in sentence_candidates(html_to_text(raw), min_chars=min_chars, max_chars=max_chars)
+    ]
+
+
+def normalized_span_match(text, terms):
+    def span_normalize(value):
+        normalized = value.casefold()
+        normalized = re.sub(r"([aeiou])['`Â´]", r"\1", normalized)
+        normalized = unicodedata.normalize("NFD", normalized)
+        normalized = "".join(char for char in normalized if unicodedata.category(char) != "Mn")
+        normalized = normalized.replace("'", "").replace("`", "").replace("Â´", "")
+        return normalized
+
+    normalized_text = span_normalize(text)
+    best = None
+    for term in sorted((term for term in terms if term.strip()), key=len, reverse=True):
+        normalized_term = span_normalize(term.strip())
+        if not normalized_term:
+            continue
+        index = normalized_text.find(normalized_term)
+        if index != -1:
+            best = (index, index + len(normalized_term))
+            break
+    if best is None:
+        return ""
+    cursor = 0
+    start = None
+    end = None
+    for index, char in enumerate(text):
+        next_cursor = cursor + len(span_normalize(char))
+        if start is None and next_cursor > best[0]:
+            start = index
+        if start is not None and next_cursor >= best[1]:
+            end = index + 1
+            break
+        cursor = next_cursor
+    if start is None or end is None:
+        return ""
+    return text[start:end].strip()
 
 
 def normalize_match_text(value):
@@ -5405,84 +5737,69 @@ def scraper_word_pattern(terms):
     )
 
 
-def unimorph_values_by_features(infinitive, required_features):
-    values = []
-    seen = set()
-    path = ensure_unimorph_cache()
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            parts = line.rstrip("\n").split("\t")
-            if len(parts) != 3 or parts[0] != infinitive:
-                continue
-            features = set(parts[2].split(";"))
-            if not required_features.issubset(features):
-                continue
-            value = parts[1].strip()
-            if value and value not in seen:
-                seen.add(value)
-                values.append(value)
-    return values
-
-
-def unimorph_present_by_pronoun(infinitive):
-    rows = lookup_unimorph_forms(infinitive, "presente")
-    return {row["pronoun"]: row["value"] for row in rows}
-
-
-def past_participle_variants(participle):
-    if participle.endswith("o"):
-        stem = participle[:-1]
-        return {
-            "masculine": stem + "o",
-            "feminine": stem + "a",
-            "masculine plural": stem + "i",
-            "feminine plural": stem + "e",
-        }
-    return {
-        "masculine": participle,
-        "feminine": participle,
-        "masculine plural": participle,
-        "feminine plural": participle,
-    }
-
-
-def unimorph_search_terms(infinitive, tense):
+def verbecc_search_terms(infinitive, tense):
     infinitive = infinitive.strip().lower()
     if not infinitive:
         raise ValueError("Verb is required.")
-    if tense == "presente":
-        return [row["value"] for row in lookup_unimorph_forms(infinitive, tense)]
-    if tense == "passato prossimo":
-        participles = unimorph_values_by_features(infinitive, {"V.PTCP", "PST"})
-        if not participles:
-            raise ValueError(f"UniMorph has no past participle for {infinitive}.")
-        participle = participles[0]
-        avere = unimorph_present_by_pronoun("avere")
-        essere = unimorph_present_by_pronoun("essere")
-        variants = past_participle_variants(participle)
-        terms = []
-        for pronoun in ("io", "tu", "lui/lei", "noi", "voi", "loro"):
-            if pronoun in avere:
-                terms.append(f"{avere[pronoun]} {variants['masculine']}")
-            if pronoun in essere:
-                if pronoun in {"io", "tu", "lui/lei"}:
-                    terms.append(f"{essere[pronoun]} {variants['masculine']}")
-                    terms.append(f"{essere[pronoun]} {variants['feminine']}")
-                else:
-                    terms.append(f"{essere[pronoun]} {variants['masculine plural']}")
-                    terms.append(f"{essere[pronoun]} {variants['feminine plural']}")
-        return terms
-    raise ValueError("Unsupported tense.")
+    terms = []
+    seen = set()
+    for form in lookup_verbecc_forms(infinitive, tense):
+        value = form["value"]
+        if value not in seen:
+            seen.add(value)
+            terms.append(value)
+    return terms
 
 
-def scrape_example_sentences(search_terms, source_urls):
-    word_pattern = scraper_word_pattern(search_terms)
+def expand_source_urls(source_lines, word, search_terms):
+    urls = []
+    seen = set()
+    query_terms = search_terms or [word]
+    for line in source_lines:
+        source = line.strip()
+        if not source.startswith(("http://", "https://")):
+            continue
+        expanded = []
+        if "{query}" in source:
+            for term in query_terms[:12]:
+                expanded.append(source.replace("{query}", quote_plus(term)))
+        else:
+            expanded.append(source)
+        for url in expanded:
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+    return urls
+
+
+def scrape_example_sentences(search_terms, source_urls, result_limit=80, min_chars=0, max_chars=320):
     results = []
     errors = []
+    report = None
+    for event in iter_scrape_events(search_terms, source_urls, result_limit, min_chars, max_chars):
+        if event["type"] == "result":
+            results.append(event["item"])
+        elif event["type"] == "error":
+            errors.append(event["message"])
+        elif event["type"] == "report":
+            report = event["report"]
+    return results, errors, report or {}
+
+
+def iter_scrape_events(search_terms, source_urls, result_limit=80, min_chars=0, max_chars=320):
+    word_pattern = scraper_word_pattern(search_terms)
+    result_limit = max(1, min(int(result_limit), SCRAPER_MAX_SENTENCES))
+    min_chars = max(0, min(int(min_chars), 1000))
+    max_chars = max(1, min(int(max_chars), 1000))
+    if min_chars > max_chars:
+        min_chars, max_chars = max_chars, min_chars
     report = {
         "sources": len(source_urls),
         "terms": len(search_terms),
         "search_terms": list(search_terms),
+        "result_limit": result_limit,
+        "min_chars": min_chars,
+        "max_chars": max_chars,
         "visited": 0,
         "links_found": 0,
         "sentences_checked": 0,
@@ -5490,52 +5807,228 @@ def scrape_example_sentences(search_terms, source_urls):
         "per_url": {},
     }
     visited = set()
+    results_count = 0
+    opener = build_opener(HTTPCookieProcessor(CookieJar()))
 
     def scan_url(url, follow_links=False):
-        if url in visited or len(results) >= SCRAPER_MAX_SENTENCES:
-            return
+        nonlocal results_count
+        if url in visited or results_count >= result_limit:
+            return []
         visited.add(url)
         report["visited"] += 1
-        before_matches = len(results)
+        before_matches = results_count
+        events = [{"type": "status", "message": f"Checking {url}"}]
         try:
-            raw = fetch_url_text(url)
+            raw = fetch_url_text(url, opener=opener)
+        except HTTPError as exc:
+            if exc.code == 403:
+                root = site_root(url)
+                try:
+                    events.append({"type": "status", "message": f"Retrying {url} after opening {root}"})
+                    fetch_url_text(root, opener=opener)
+                    raw = fetch_url_text(url, opener=opener, referer=root)
+                except HTTPError as retry_exc:
+                    if retry_exc.code in {403, 404}:
+                        events.append({"type": "status", "message": f"Skipped {url}: HTTP {retry_exc.code}"})
+                    else:
+                        events.append({"type": "error", "message": f"{url}: HTTP {retry_exc.code}"})
+                    return events
+                except Exception as retry_exc:
+                    events.append({"type": "error", "message": f"{url}: {retry_exc}"})
+                    return events
+            elif exc.code == 404:
+                events.append({"type": "status", "message": f"Skipped {url}: HTTP 404"})
+                return events
+            else:
+                events.append({"type": "error", "message": f"{url}: HTTP {exc.code}"})
+                return events
         except Exception as exc:
-            errors.append(f"{url}: {exc}")
-            return
-        text = html_to_text(raw)
-        for sentence in sentence_candidates(text):
+            message = f"{url}: {exc}"
+            events.append({"type": "error", "message": message})
+            return events
+        for item_data in content_sentence_items(raw, url, min_chars=min_chars, max_chars=max_chars):
+            sentence = item_data["sentence"]
             report["sentences_checked"] += 1
             if word_pattern and word_pattern.search(normalize_match_text(sentence)):
-                results.append({"sentence": sentence + ".", "source": url})
-                if len(results) >= SCRAPER_MAX_SENTENCES:
-                    report["matches"] = len(results)
-                    report["per_url"][url] = len(results) - before_matches
-                    return
-        found_here = len(results) - before_matches
+                results_count += 1
+                target = normalized_span_match(sentence, search_terms)
+                item = {
+                    "sentence": sentence + ".",
+                    "source": url,
+                    "target": target,
+                    "translation": item_data.get("translation", ""),
+                }
+                events.append({"type": "result", "item": item})
+                if results_count >= result_limit:
+                    report["matches"] = results_count
+                    report["per_url"][url] = results_count - before_matches
+                    return events
+        found_here = results_count - before_matches
         if found_here:
             report["per_url"][url] = found_here
         if follow_links:
             links = extract_links(raw, url)
             report["links_found"] += len(links)
+            events.append({"type": "status", "message": f"Found {len(links)} article links in {url}"})
             for link in links:
-                scan_url(link, follow_links=False)
-                if len(results) >= SCRAPER_MAX_SENTENCES:
-                    report["matches"] = len(results)
-                    return
+                events.extend(scan_url(link, follow_links=False))
+                if results_count >= result_limit:
+                    report["matches"] = results_count
+                    return events
+        return events
 
     for source_url in source_urls:
-        scan_url(source_url, follow_links=True)
-    report["matches"] = len(results)
-    return results, errors, report
+        for event in scan_url(source_url, follow_links=True):
+            yield event
+        if results_count >= result_limit:
+            break
+    report["matches"] = results_count
+    yield {"type": "report", "report": report}
+    yield {"type": "done", "message": f"Done. Found {results_count} results."}
 
 
-def render_sentence_scraper(username, user, word="", tense="", sources="", results=None, errors=None, report=None):
+def create_cloze_from_phrase(phrase, answer, translation):
+    phrase = phrase.strip()
+    answer = answer.strip()
+    translation = translation.strip()
+    if not phrase or not answer or not translation:
+        return False, "Phrase, cloze text, and translation are required."
+    def span_normalize(value):
+        text = value.casefold()
+        text = re.sub(r"([aeiou])['`Â´]", r"\1", text)
+        text = unicodedata.normalize("NFD", text)
+        text = "".join(char for char in text if unicodedata.category(char) != "Mn")
+        text = text.replace("'", "").replace("`", "").replace("Â´", "")
+        return text
+
+    normalized_phrase = span_normalize(phrase)
+    normalized_answer = span_normalize(answer.strip())
+    normalized_index = normalized_phrase.find(normalized_answer)
+    if normalized_index == -1:
+        return False, "The cloze text was not found inside the selected phrase."
+    cursor = 0
+    start = None
+    end = None
+    for index, char in enumerate(phrase):
+        normalized_char = span_normalize(char)
+        next_cursor = cursor + len(normalized_char)
+        if start is None and next_cursor > normalized_index:
+            start = index
+        if start is not None and next_cursor >= normalized_index + len(normalized_answer):
+            end = index + 1
+            break
+        cursor = next_cursor
+    if start is None or end is None:
+        return False, "The cloze text was not found inside the selected phrase."
+    stored_answer = phrase[start:end].strip()
+    cloze_sentence = phrase[:start] + "____" + phrase[end:]
+    uid = make_cloze_uid(cloze_sentence, stored_answer)
+    content_hash = cloze_content_hash(cloze_sentence, stored_answer, translation)
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO cloze_questions
+                (uid, sentence, answer, translation, content_hash, revision, elo, active, status, is_new)
+            VALUES (?, ?, ?, ?, ?, 1, ?, 1, 'approved', 1)
+            """,
+            (uid, cloze_sentence, stored_answer, translation, content_hash, DEFAULT_ELO),
+        )
+    return True, "Cloze card created."
+
+
+def extract_response_text(data):
+    if data.get("output_text"):
+        return data["output_text"]
+    chunks = []
+    for output in data.get("output", []):
+        for content in output.get("content", []):
+            if content.get("type") in {"output_text", "text"} and content.get("text"):
+                chunks.append(content["text"])
+    return "\n".join(chunks).strip()
+
+
+def translate_sentences_with_openai(sentences, api_key=""):
+    api_key = (api_key or os.environ.get("OPENAI_API_KEY", "")).strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set.")
+    clean_sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
+    if not clean_sentences:
+        return []
+    model = os.environ.get("OPENAI_TRANSLATION_MODEL", "gpt-4.1-mini")
+    prompt = (
+        "Translate these Italian sentences into natural Japanese. "
+        "Return only a JSON object with key \"translations\", whose value is an array of strings in the same order.\n\n"
+        + json.dumps(clean_sentences, ensure_ascii=False)
+    )
+    payload = json.dumps(
+        {
+            "model": model,
+            "input": prompt,
+            "text": {"format": {"type": "json_object"}},
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = Request(
+        "https://api.openai.com/v1/responses",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urlopen(request, timeout=45) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    text = extract_response_text(data)
+    parsed = json.loads(text)
+    if isinstance(parsed, dict):
+        parsed = parsed.get("translations", [])
+    if not isinstance(parsed, list):
+        raise RuntimeError("OpenAI response did not contain a translation list.")
+    return [str(item) for item in parsed]
+
+
+def highlight_sentence_html(sentence, target):
+    if not target:
+        return escape(sentence)
+    start = normalize_match_text(sentence).find(normalize_match_text(target))
+    if start == -1:
+        return escape(sentence)
+    match = normalized_span_match(sentence, [target])
+    if not match:
+        return escape(sentence)
+    raw_start = sentence.find(match)
+    if raw_start == -1:
+        return escape(sentence)
+    raw_end = raw_start + len(match)
+    return (
+        escape(sentence[:raw_start])
+        + f'<span class="cloze-hit">{escape(sentence[raw_start:raw_end])}</span>'
+        + escape(sentence[raw_end:])
+    )
+
+
+def render_sentence_scraper(
+    username,
+    user,
+    word="",
+    tense="",
+    sources="",
+    result_limit=20,
+    min_chars=40,
+    max_chars=180,
+    results=None,
+    errors=None,
+    report=None,
+    message="",
+):
     nav_html = render_nav(username, user, "管理")
     default_sources = "\n".join(SCRAPER_DEFAULT_SOURCES)
     sources_value = sources if sources else default_sources
     results = results or []
     errors = errors or []
     report = report or {}
+    message_html = f'<div class="notice ok">{escape(message)}</div>' if message else ""
     search_tense_options = '<option value="" selected>単語だけ</option>'
     search_tense_options += "".join(
         f'<option value="{escape(key)}" {"selected" if key == tense else ""}>{escape(info["label"])}</option>'
@@ -5544,7 +6037,12 @@ def render_sentence_scraper(username, user, word="", tense="", sources="", resul
     result_html = (
         "".join(
             '<div class="result-item">'
-            f'<div class="sentence">{escape(item["sentence"])}</div>'
+            f'<input class="result-check" type="checkbox" />'
+            '<div class="result-main">'
+            f'<div class="sentence">{highlight_sentence_html(item["sentence"], item.get("target", ""))}</div>'
+            f'<button class="mini-button create-card-button" type="button" data-sentence="{escape(item["sentence"])}" data-target="{escape(item.get("target", ""))}" data-translation="{escape(item.get("translation", ""))}" onclick="openClozeModal(this)">+</button>'
+            '</div>'
+            f'<div class="translation">{escape(item.get("translation", ""))}</div>'
             f'<div class="source">{escape(item["source"])}</div>'
             "</div>"
             for item in results
@@ -5573,6 +6071,9 @@ def render_sentence_scraper(username, user, word="", tense="", sources="", resul
           <strong>収集レポート</strong>
           <div>入力ソース: {int(report.get("sources", 0))}</div>
           <div>検索フォーム数: {int(report.get("terms", 0))}</div>
+          <div>結果上限: {int(report.get("result_limit", result_limit))}</div>
+          <div>最小文字数: {int(report.get("min_chars", min_chars))}</div>
+          <div>最大文字数: {int(report.get("max_chars", max_chars))}</div>
           {terms_html}
           <div>確認したURL: {int(report.get("visited", 0))}</div>
           <div>見つけた記事リンク: {int(report.get("links_found", 0))}</div>
@@ -5582,11 +6083,10 @@ def render_sentence_scraper(username, user, word="", tense="", sources="", resul
         </div>
         """
     source_library_html = "".join(
-        '<div class="source-row">'
-        f'<div><strong>{escape(name)}</strong><span>{escape(kind)}</span></div>'
-        f'<code>{escape(url)}</code>'
-        f'<button class="mini-button" type="button" data-source="{escape(url)}" onclick="addSource(this)">+</button>'
-        "</div>"
+        '<label class="source-choice">'
+        f'<input type="checkbox" value="{escape(url)}" />'
+        f'<span><strong>{escape(name)}</strong><em>{escape(kind)}</em><code>{escape(url)}</code></span>'
+        "</label>"
         for name, kind, url in SCRAPER_SOURCE_LIBRARY
     )
     all_source_urls = "\n".join(url for _, _, url in SCRAPER_SOURCE_LIBRARY)
@@ -5656,7 +6156,7 @@ def render_sentence_scraper(username, user, word="", tense="", sources="", resul
       .search-grid {{
         display: grid;
         gap: 12px;
-        grid-template-columns: minmax(0, 1fr) 220px;
+        grid-template-columns: minmax(0, 1fr) 170px 120px 120px 120px;
       }}
       textarea {{
         min-height: 120px;
@@ -5673,6 +6173,9 @@ def render_sentence_scraper(username, user, word="", tense="", sources="", resul
         margin-top: 14px;
         padding: 11px 16px;
       }}
+      button.secondary {{
+        background: #b8aa97;
+      }}
       .result-list {{
         display: grid;
         gap: 8px;
@@ -5682,21 +6185,60 @@ def render_sentence_scraper(username, user, word="", tense="", sources="", resul
         background: #faf7f0;
         border: 1px solid #e8e0d4;
         border-radius: 8px;
+        display: grid;
+        gap: 8px 10px;
+        grid-template-columns: auto minmax(0, 1fr);
         padding: 12px;
+      }}
+      .result-check {{
+        margin-top: 3px;
+        width: auto;
+      }}
+      .result-main, .source, .translation {{
+        grid-column: 2;
       }}
       .sentence {{
         font-size: 15px;
         line-height: 1.45;
+      }}
+      .cloze-hit {{
+        background: #ffe08a;
+        border-radius: 4px;
+        color: #513f13;
+        padding: 0 3px;
+      }}
+      .result-main {{
+        align-items: flex-start;
+        display: grid;
+        gap: 10px;
+        grid-template-columns: minmax(0, 1fr) auto;
+      }}
+      .create-card-button {{
+        margin-top: 0;
       }}
       .source, .empty {{
         color: #7a7065;
         font-size: 12px;
         margin-top: 5px;
       }}
+      .translation {{
+        color: #557a53;
+        font-size: 13px;
+      }}
+      .created-card {{
+        opacity: 0.62;
+      }}
+      .scrape-actions {{
+        align-items: center;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+      }}
+      #openai-api-key {{
+        max-width: 260px;
+      }}
       .source-library {{
         border-top: 1px solid #e8e0d4;
-        display: grid;
-        gap: 6px;
         margin-top: 16px;
         padding-top: 14px;
       }}
@@ -5711,19 +6253,30 @@ def render_sentence_scraper(username, user, word="", tense="", sources="", resul
         font-size: 15px;
         margin: 0;
       }}
-      .source-row {{
-        align-items: center;
-        display: grid;
-        gap: 8px;
-        grid-template-columns: 180px minmax(0, 1fr) auto;
+      .source-summary {{
+        color: #7a7065;
+        font-size: 12px;
+        margin-top: 8px;
       }}
-      .source-row span {{
+      .source-choice {{
+        align-items: start;
+        border-bottom: 1px solid #eee7dc;
+        display: grid;
+        gap: 10px;
+        grid-template-columns: auto minmax(0, 1fr);
+        padding: 8px 0;
+      }}
+      .source-choice input {{
+        margin-top: 3px;
+        width: auto;
+      }}
+      .source-choice em {{
         color: #7a7065;
         display: block;
         font-size: 11px;
-        font-weight: 400;
+        font-style: normal;
       }}
-      .source-row code {{
+      .source-choice code {{
         background: #faf7f0;
         border: 1px solid #e8e0d4;
         border-radius: 6px;
@@ -5735,6 +6288,10 @@ def render_sentence_scraper(username, user, word="", tense="", sources="", resul
         padding: 5px 7px;
         text-overflow: ellipsis;
         white-space: nowrap;
+      }}
+      .source-picker-list {{
+        max-height: 52vh;
+        overflow: auto;
       }}
       .mini-button {{
         border-radius: 7px;
@@ -5773,8 +6330,49 @@ def render_sentence_scraper(username, user, word="", tense="", sources="", resul
       .working {{
         display: none;
       }}
+      .notice {{
+        border-radius: 8px;
+        font-size: 13px;
+        margin-bottom: 14px;
+        padding: 10px 12px;
+      }}
+      .ok {{
+        background: #e9f1e8;
+        color: #557a53;
+      }}
+      .modal-backdrop {{
+        align-items: center;
+        background: rgba(61, 54, 48, 0.42);
+        display: none;
+        inset: 0;
+        justify-content: center;
+        padding: 20px;
+        position: fixed;
+        z-index: 20;
+      }}
+      .modal {{
+        background: #fffef9;
+        border: 1px solid #e8e0d4;
+        border-radius: 10px;
+        box-shadow: 0 20px 60px rgba(61, 54, 48, 0.24);
+        max-width: 720px;
+        padding: 18px;
+        width: min(720px, 100%);
+      }}
+      .modal h2 {{
+        font-size: 18px;
+        margin: 0 0 8px;
+      }}
+      .modal-actions {{
+        display: flex;
+        gap: 10px;
+        justify-content: flex-end;
+      }}
+      .modal-actions .secondary {{
+        background: #b8aa97;
+      }}
       @media (max-width: 720px) {{
-        .search-grid, .source-row {{
+        .search-grid {{
           grid-template-columns: 1fr;
         }}
       }}
@@ -5785,6 +6383,276 @@ def render_sentence_scraper(username, user, word="", tense="", sources="", resul
         if (box) {{
           box.style.display = "block";
           box.textContent = "ソースと記事リンクを確認中です。各ページは最大{SCRAPER_TIMEOUT_SECONDS}秒でタイムアウトし、各ソースから最大{SCRAPER_MAX_SOURCE_LINKS}件の記事を確認します。";
+        }}
+      }}
+      function escapeHtml(value) {{
+        return String(value).replace(/[&<>"']/g, function(char) {{
+          return {{"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}}[char];
+        }});
+      }}
+      var scrapeController = null;
+      var sourceStorageKey = "verbiScraperSourcesV3";
+      function highlightTarget(sentence, target) {{
+        if (!target) {{
+          return escapeHtml(sentence);
+        }}
+        var index = sentence.toLocaleLowerCase().indexOf(target.toLocaleLowerCase());
+        if (index === -1) {{
+          return escapeHtml(sentence);
+        }}
+        return escapeHtml(sentence.slice(0, index)) +
+          '<span class="cloze-hit">' + escapeHtml(sentence.slice(index, index + target.length)) + '</span>' +
+          escapeHtml(sentence.slice(index + target.length));
+      }}
+      function appendScrapeResult(item) {{
+        var list = document.getElementById("result-list");
+        if (!list) {{
+          return;
+        }}
+        var empty = list.querySelector(".empty");
+        if (empty) {{
+          empty.remove();
+        }}
+        var div = document.createElement("div");
+        div.className = "result-item";
+        div.dataset.sentence = item.sentence || "";
+        div.dataset.target = item.target || "";
+        div.dataset.translation = item.translation || "";
+        div.innerHTML =
+          '<input class="result-check" type="checkbox" />' +
+          '<div class="result-main">' +
+          '<div class="sentence">' + highlightTarget(item.sentence || "", item.target || "") + '</div>' +
+          '<button class="mini-button create-card-button" type="button" data-sentence="' + escapeHtml(item.sentence || "") + '" data-target="' + escapeHtml(item.target || "") + '" data-translation="' + escapeHtml(item.translation || "") + '" onclick="openClozeModal(this)">+</button>' +
+          '</div>' +
+          '<div class="translation">' + escapeHtml(item.translation || "") + '</div>' +
+          '<div class="source">' + escapeHtml(item.source) + '</div>';
+        list.appendChild(div);
+      }}
+      function appendScrapeError(message) {{
+        var box = document.getElementById("errors-container");
+        if (!box) {{
+          return;
+        }}
+        var errors = box.querySelector(".errors");
+        if (!errors) {{
+          errors = document.createElement("div");
+          errors.className = "errors";
+          box.appendChild(errors);
+        }}
+        var line = document.createElement("div");
+        line.textContent = message;
+        errors.appendChild(line);
+      }}
+      function updateScrapeReport(report) {{
+        var box = document.getElementById("report-container");
+        if (!box || !report) {{
+          return;
+        }}
+        var terms = (report.search_terms || []).slice(0, 24).join(", ");
+        var perUrl = Object.entries(report.per_url || {{}}).map(function(entry) {{
+          return "<li>" + escapeHtml(entry[0]) + ": " + Number(entry[1]) + "</li>";
+        }}).join("");
+        box.innerHTML =
+          '<div class="run-report">' +
+          '<strong>収集レポート</strong>' +
+          '<div>入力ソース: ' + Number(report.sources || 0) + '</div>' +
+          '<div>検索フォーム数: ' + Number(report.terms || 0) + '</div>' +
+          '<div>結果上限: ' + Number(report.result_limit || 0) + '</div>' +
+          '<div>最小文字数: ' + Number(report.min_chars || 0) + '</div>' +
+          '<div>最大文字数: ' + Number(report.max_chars || 0) + '</div>' +
+          (terms ? '<div class="terms-preview">' + escapeHtml(terms) + '</div>' : '') +
+          '<div>確認したURL: ' + Number(report.visited || 0) + '</div>' +
+          '<div>見つけた記事リンク: ' + Number(report.links_found || 0) + '</div>' +
+          '<div>確認した文候補: ' + Number(report.sentences_checked || 0) + '</div>' +
+          '<div>一致した例文: ' + Number(report.matches || 0) + '</div>' +
+          '<ul>' + perUrl + '</ul>' +
+          '</div>';
+      }}
+      function setScrapeStatus(message) {{
+        var box = document.getElementById("scrape-status");
+        if (box) {{
+          box.style.display = "block";
+          box.textContent = message;
+        }}
+      }}
+      function startScrapeStream(form) {{
+        if (!window.fetch || !window.TextDecoder || !window.ReadableStream) {{
+          showScrapeStatus();
+          return true;
+        }}
+        showScrapeStatus();
+        scrapeController = new AbortController();
+        document.getElementById("stop-scrape-button").style.display = "inline-block";
+        document.getElementById("result-list").innerHTML = '<div class="empty">検索中...</div>';
+        document.getElementById("errors-container").innerHTML = "";
+        document.getElementById("report-container").innerHTML = "";
+        fetch("/admin/sentence-scraper/stream", {{
+          method: "POST",
+          body: new URLSearchParams(new FormData(form))
+          , signal: scrapeController.signal
+        }}).then(function(response) {{
+          if (!response.body) {{
+            form.submit();
+            return;
+          }}
+          var reader = response.body.getReader();
+          var decoder = new TextDecoder();
+          var buffer = "";
+          function pump() {{
+            return reader.read().then(function(chunk) {{
+              if (chunk.done) {{
+                if (buffer.trim()) {{
+                  handleScrapeLine(buffer.trim());
+                }}
+                return;
+              }}
+              buffer += decoder.decode(chunk.value, {{stream: true}});
+              var lines = buffer.split("\\n");
+              buffer = lines.pop();
+              lines.forEach(handleScrapeLine);
+              return pump();
+            }});
+          }}
+          return pump();
+        }}).catch(function(error) {{
+          if (error.name === "AbortError") {{
+            setScrapeStatus("Stopped.");
+          }} else {{
+            appendScrapeError(error.message || String(error));
+          }}
+        }}).finally(function() {{
+          document.getElementById("stop-scrape-button").style.display = "none";
+          scrapeController = null;
+        }});
+        return false;
+      }}
+      function stopScrape() {{
+        if (scrapeController) {{
+          scrapeController.abort();
+        }}
+      }}
+      function selectedResultItems() {{
+        return Array.from(document.querySelectorAll(".result-item")).filter(function(item) {{
+          var checkbox = item.querySelector(".result-check");
+          return checkbox && checkbox.checked;
+        }});
+      }}
+      function setResultSelection(mode) {{
+        document.querySelectorAll(".result-item").forEach(function(item) {{
+          var checkbox = item.querySelector(".result-check");
+          if (!checkbox) {{
+            return;
+          }}
+          if (mode === "all") {{
+            checkbox.checked = true;
+          }} else if (mode === "missing") {{
+            checkbox.checked = !(item.dataset.translation || "").trim();
+          }} else if (mode === "translated") {{
+            checkbox.checked = Boolean((item.dataset.translation || "").trim());
+          }} else if (mode === "clear") {{
+            checkbox.checked = false;
+          }}
+        }});
+      }}
+      function translateSelectedResults() {{
+        var items = selectedResultItems();
+        if (!items.length) {{
+          setScrapeStatus("No results selected.");
+          return;
+        }}
+        setScrapeStatus("Translating selected results...");
+        var sentences = items.map(function(item) {{ return item.dataset.sentence || ""; }});
+        var apiKeyInput = document.getElementById("openai-api-key");
+        var apiKey = apiKeyInput ? apiKeyInput.value : "";
+        fetch("/admin/sentence-scraper/translate", {{
+          method: "POST",
+          body: new URLSearchParams({{items: JSON.stringify(sentences), api_key: apiKey}})
+        }}).then(function(response) {{
+          return response.json();
+        }}).then(function(data) {{
+          if (data.error) {{
+            appendScrapeError(data.error);
+            return;
+          }}
+          (data.translations || []).forEach(function(translation, index) {{
+            var item = items[index];
+            if (!item) {{
+              return;
+            }}
+            item.dataset.translation = translation;
+            var translationBox = item.querySelector(".translation");
+            if (translationBox) {{
+              translationBox.textContent = translation;
+            }}
+            var button = item.querySelector(".create-card-button");
+            if (button) {{
+              button.setAttribute("data-translation", translation);
+            }}
+          }});
+          setScrapeStatus("Translations added.");
+        }}).catch(function(error) {{
+          appendScrapeError(error.message || String(error));
+        }});
+      }}
+      function createSelectedCards() {{
+        var items = selectedResultItems();
+        if (!items.length) {{
+          setScrapeStatus("No results selected.");
+          return;
+        }}
+        var cards = items.map(function(item) {{
+          return {{
+            phrase: item.dataset.sentence || "",
+            answer: item.dataset.target || "",
+            translation: item.dataset.translation || ""
+          }};
+        }});
+        setScrapeStatus("Creating selected cards...");
+        fetch("/admin/sentence-scraper/create-cloze-batch", {{
+          method: "POST",
+          body: new URLSearchParams({{items: JSON.stringify(cards)}})
+        }}).then(function(response) {{
+          return response.json();
+        }}).then(function(data) {{
+          if (data.error) {{
+            appendScrapeError(data.error);
+            return;
+          }}
+          (data.results || []).forEach(function(result, index) {{
+            var item = items[index];
+            if (!item) {{
+              return;
+            }}
+            if (result.ok) {{
+              item.classList.add("created-card");
+              var checkbox = item.querySelector(".result-check");
+              if (checkbox) {{
+                checkbox.checked = false;
+              }}
+            }} else {{
+              appendScrapeError(result.error || "Card could not be created.");
+            }}
+          }});
+          setScrapeStatus("Created " + Number(data.created || 0) + " cards. Skipped " + Number(data.skipped || 0) + ".");
+        }}).catch(function(error) {{
+          appendScrapeError(error.message || String(error));
+        }});
+      }}
+      function handleScrapeLine(line) {{
+        if (!line) {{
+          return;
+        }}
+        var event = JSON.parse(line);
+        if (event.type === "status") {{
+          setScrapeStatus(event.message);
+        }} else if (event.type === "result") {{
+          appendScrapeResult(event.item);
+        }} else if (event.type === "error") {{
+          appendScrapeError(event.message);
+        }} else if (event.type === "report") {{
+          updateScrapeReport(event.report);
+        }} else if (event.type === "done") {{
+          setScrapeStatus(event.message);
         }}
       }}
       function addSource(button) {{
@@ -5815,6 +6683,93 @@ def render_sentence_scraper(username, user, word="", tense="", sources="", resul
         var urls = document.getElementById("all-source-urls").value.split(/\\r?\\n/);
         addSources(urls);
       }}
+      function sourceTextarea() {{
+        return document.querySelector("textarea[name='sources']");
+      }}
+      function sourceLines() {{
+        var textarea = sourceTextarea();
+        if (!textarea) {{
+          return [];
+        }}
+        return textarea.value.split(/\\r?\\n/).map(function(line) {{ return line.trim(); }}).filter(Boolean);
+      }}
+      function updateSourceSummary() {{
+        var summary = document.getElementById("source-summary");
+        if (summary) {{
+          summary.textContent = sourceLines().length + " sources selected";
+        }}
+      }}
+      function openSourceModal() {{
+        var selected = sourceLines();
+        document.querySelectorAll("#source-modal input[type='checkbox']").forEach(function(input) {{
+          input.checked = selected.indexOf(input.value) !== -1;
+        }});
+        document.getElementById("source-modal").style.display = "flex";
+      }}
+      function closeSourceModal() {{
+        document.getElementById("source-modal").style.display = "none";
+      }}
+      function applySourceSelection() {{
+        var urls = [];
+        document.querySelectorAll("#source-modal input[type='checkbox']:checked").forEach(function(input) {{
+          urls.push(input.value);
+        }});
+        var textarea = sourceTextarea();
+        if (textarea) {{
+          textarea.value = urls.join("\\n");
+          localStorage.setItem(sourceStorageKey, textarea.value);
+        }}
+        updateSourceSummary();
+        closeSourceModal();
+      }}
+      function setAllSourceChoices(checked) {{
+        document.querySelectorAll("#source-modal input[type='checkbox']").forEach(function(input) {{
+          input.checked = checked;
+        }});
+      }}
+      function useRecommendedSources() {{
+        var textarea = sourceTextarea();
+        var defaults = document.getElementById("default-source-urls");
+        if (textarea && defaults) {{
+          textarea.value = defaults.value;
+          localStorage.setItem(sourceStorageKey, textarea.value);
+        }}
+        updateSourceSummary();
+        closeSourceModal();
+      }}
+      function restoreSavedSources() {{
+        var saved = localStorage.getItem(sourceStorageKey);
+        var textarea = sourceTextarea();
+        if (saved && textarea) {{
+          textarea.value = saved;
+        }}
+        updateSourceSummary();
+      }}
+      function openClozeModal(button) {{
+        var sentence = button.getAttribute("data-sentence") || "";
+        var target = button.getAttribute("data-target") || "";
+        var translation = button.getAttribute("data-translation") || "";
+        document.getElementById("cloze-phrase").value = sentence;
+        document.getElementById("cloze-answer").value = target;
+        document.getElementById("cloze-translation").value = translation;
+        document.getElementById("cloze-modal").style.display = "flex";
+        document.getElementById("cloze-answer").focus();
+      }}
+      function closeClozeModal() {{
+        document.getElementById("cloze-modal").style.display = "none";
+      }}
+      function useSelectedClozeText() {{
+        var phrase = document.getElementById("cloze-phrase");
+        var answer = document.getElementById("cloze-answer");
+        if (!phrase || !answer) {{
+          return;
+        }}
+        var selected = phrase.value.substring(phrase.selectionStart, phrase.selectionEnd).trim();
+        if (selected) {{
+          answer.value = selected;
+        }}
+      }}
+      document.addEventListener("DOMContentLoaded", restoreSavedSources);
     </script>
   </head>
   <body>
@@ -5822,7 +6777,8 @@ def render_sentence_scraper(username, user, word="", tense="", sources="", resul
       {nav_html}
       <section class="card">
         <h1>例文スクレイパー</h1>
-        <form method="post" action="/admin/sentence-scraper" onsubmit="showScrapeStatus()">
+        {message_html}
+        <form method="post" action="/admin/sentence-scraper" onsubmit="return startScrapeStream(this)">
           <div class="search-grid">
             <div>
               <label>検索する語 / 動詞</label>
@@ -5832,26 +6788,82 @@ def render_sentence_scraper(username, user, word="", tense="", sources="", resul
               <label>時制</label>
               <select name="tense">{search_tense_options}</select>
             </div>
+            <div>
+              <label>結果数</label>
+              <input name="result_limit" type="number" min="1" max="{SCRAPER_MAX_SENTENCES}" value="{int(result_limit)}" />
+            </div>
+            <div>
+              <label>最小文字数</label>
+              <input name="min_chars" type="number" min="0" max="1000" value="{int(min_chars)}" />
+            </div>
+            <div>
+              <label>最大文字数</label>
+              <input name="max_chars" type="number" min="1" max="1000" value="{int(max_chars)}" />
+            </div>
           </div>
           <label>ソースURL（RSSまたはページ、1行に1つ）</label>
           <textarea name="sources">{escape(sources_value)}</textarea>
-          <button type="submit">収集</button>
-        </form>
-        <div class="source-library">
-          <div class="source-library-head">
-            <h2>ソース候補</h2>
-            <button class="mini-button" type="button" onclick="addAllSources()">全部追加</button>
+          <div class="source-library">
+            <div class="source-library-head">
+              <h2>ソース選択</h2>
+              <button class="mini-button" type="button" onclick="openSourceModal()">選択</button>
+            </div>
+            <div id="source-summary" class="source-summary"></div>
           </div>
-          <textarea id="all-source-urls" hidden>{escape(all_source_urls)}</textarea>
-          {source_library_html}
-        </div>
+          <div class="scrape-actions">
+            <button type="submit">収集</button>
+            <button id="stop-scrape-button" class="secondary" type="button" onclick="stopScrape()" style="display:none">停止</button>
+            <button class="secondary" type="button" onclick="setResultSelection('all')">全部選択</button>
+            <button class="secondary" type="button" onclick="setResultSelection('missing')">未翻訳を選択</button>
+            <button class="secondary" type="button" onclick="setResultSelection('translated')">翻訳済みを選択</button>
+            <button class="secondary" type="button" onclick="setResultSelection('clear')">選択解除</button>
+            <input id="openai-api-key" type="password" autocomplete="off" placeholder="OpenAI API key" />
+            <button class="secondary" type="button" onclick="translateSelectedResults()">選択を翻訳</button>
+            <button class="secondary" type="button" onclick="createSelectedCards()">選択をカード化</button>
+          </div>
+        </form>
+        <textarea id="all-source-urls" hidden>{escape(all_source_urls)}</textarea>
+        <textarea id="default-source-urls" hidden>{escape(default_sources)}</textarea>
         <div id="scrape-status" class="working"></div>
-        {report_html}
-        {errors_html}
-        <div class="result-list">
+        <div id="report-container">{report_html}</div>
+        <div id="errors-container">{errors_html}</div>
+        <div id="result-list" class="result-list">
           {result_html}
         </div>
       </section>
+      <div id="cloze-modal" class="modal-backdrop">
+        <form class="modal" method="post" action="/admin/sentence-scraper/create-cloze">
+          <h2>クローズカード作成</h2>
+          <label>カードに使う文の範囲</label>
+          <textarea id="cloze-phrase" name="phrase" required></textarea>
+          <label>穴埋めにする部分</label>
+          <button class="mini-button" type="button" onclick="useSelectedClozeText()">選択</button>
+          <input id="cloze-answer" name="answer" required />
+          <label>翻訳</label>
+          <textarea id="cloze-translation" name="translation" required></textarea>
+          <div class="modal-actions">
+            <button class="secondary" type="button" onclick="closeClozeModal()">閉じる</button>
+            <button type="submit">保存</button>
+          </div>
+        </form>
+      </div>
+      <div id="source-modal" class="modal-backdrop">
+        <div class="modal">
+          <h2>ソース選択</h2>
+          <div class="modal-actions">
+            <button class="secondary" type="button" onclick="useRecommendedSources()">おすすめ</button>
+            <button class="secondary" type="button" onclick="setAllSourceChoices(true)">全部</button>
+            <button class="secondary" type="button" onclick="setAllSourceChoices(false)">クリア</button>
+          </div>
+          <div class="source-picker-list">
+            {source_library_html}
+          </div>
+          <div class="modal-actions">
+            <button class="secondary" type="button" onclick="closeSourceModal()">閉じる</button>
+            <button type="button" onclick="applySourceSelection()">保存</button>
+          </div>
+        </div>
+      </div>
     </main>
   </body>
 </html>"""
@@ -6042,6 +7054,81 @@ def application(environ, start_response):
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [body.encode("utf-8")]
 
+    if path == "/admin/sentence-scraper/stream" and environ.get("REQUEST_METHOD") == "POST":
+        if not user.get("is_admin"):
+            return redirect(start_response, "/")
+        form = parse_post(environ)
+        word = form.get("word", "").strip()
+        tense = form.get("tense", "").strip()
+        try:
+            result_limit = int(form.get("result_limit", "20"))
+        except ValueError:
+            result_limit = 20
+        try:
+            min_chars = int(form.get("min_chars", "40"))
+        except ValueError:
+            min_chars = 40
+        try:
+            max_chars = int(form.get("max_chars", "180"))
+        except ValueError:
+            max_chars = 180
+        def stream():
+            try:
+                search_terms = verbecc_search_terms(word, tense) if tense else [word]
+                source_urls = expand_source_urls(
+                    form.get("sources", "").splitlines(),
+                    word,
+                    search_terms,
+                )
+                for event in iter_scrape_events(
+                    search_terms,
+                    source_urls,
+                    result_limit=result_limit,
+                    min_chars=min_chars,
+                    max_chars=max_chars,
+                ):
+                    yield (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+            except (RuntimeError, ValueError) as exc:
+                yield (json.dumps({"type": "error", "message": str(exc)}, ensure_ascii=False) + "\n").encode("utf-8")
+                report = {
+                    "sources": 0,
+                    "terms": 0,
+                    "result_limit": result_limit,
+                    "min_chars": min_chars,
+                    "max_chars": max_chars,
+                    "visited": 0,
+                    "links_found": 0,
+                    "sentences_checked": 0,
+                    "matches": 0,
+                    "per_url": {},
+                }
+                yield (json.dumps({"type": "report", "report": report}, ensure_ascii=False) + "\n").encode("utf-8")
+                yield (json.dumps({"type": "done", "message": "Done. Found 0 results."}, ensure_ascii=False) + "\n").encode("utf-8")
+
+        start_response(
+            "200 OK",
+            [
+                ("Content-Type", "application/x-ndjson; charset=utf-8"),
+                ("Cache-Control", "no-cache"),
+                ("X-Accel-Buffering", "no"),
+            ],
+        )
+        return stream()
+
+    if path == "/admin/sentence-scraper/translate" and environ.get("REQUEST_METHOD") == "POST":
+        if not user.get("is_admin"):
+            start_response("403 Forbidden", [("Content-Type", "application/json; charset=utf-8")])
+            return [json.dumps({"error": "Forbidden"}).encode("utf-8")]
+        form = parse_post(environ)
+        try:
+            sentences = json.loads(form.get("items", "[]"))
+            translations = translate_sentences_with_openai(sentences, form.get("api_key", ""))
+            body = {"translations": translations}
+        except Exception as exc:
+            body = {"error": str(exc)}
+        start_response("200 OK", [("Content-Type", "application/json; charset=utf-8")])
+        return [json.dumps(body, ensure_ascii=False).encode("utf-8")]
+
     if path == "/admin/sentence-scraper":
         if not user.get("is_admin"):
             return redirect(start_response, "/")
@@ -6049,23 +7136,46 @@ def application(environ, start_response):
             form = parse_post(environ)
             word = form.get("word", "").strip()
             tense = form.get("tense", "").strip()
-            sources = form.get("sources", "")
-            source_urls = [
-                line.strip()
-                for line in sources.splitlines()
-                if line.strip().startswith(("http://", "https://"))
-            ]
             try:
-                search_terms = unimorph_search_terms(word, tense) if tense else [word]
-                results, errors, report = scrape_example_sentences(search_terms, source_urls)
+                result_limit = int(form.get("result_limit", "20"))
+            except ValueError:
+                result_limit = 20
+            try:
+                min_chars = int(form.get("min_chars", "40"))
+            except ValueError:
+                min_chars = 40
+            try:
+                max_chars = int(form.get("max_chars", "180"))
+            except ValueError:
+                max_chars = 180
+            sources = form.get("sources", "")
+            try:
+                search_terms = verbecc_search_terms(word, tense) if tense else [word]
+                source_urls = expand_source_urls(sources.splitlines(), word, search_terms)
+                results, errors, report = scrape_example_sentences(
+                    search_terms,
+                    source_urls,
+                    result_limit=result_limit,
+                    min_chars=min_chars,
+                    max_chars=max_chars,
+                )
             except (RuntimeError, ValueError) as exc:
-                results, errors, report = [], [str(exc)], {"sources": len(source_urls), "terms": 0}
+                results, errors, report = [], [str(exc)], {
+                    "sources": 0,
+                    "terms": 0,
+                    "result_limit": result_limit,
+                    "min_chars": min_chars,
+                    "max_chars": max_chars,
+                }
             body = render_sentence_scraper(
                 username,
                 user,
                 word=word,
                 tense=tense,
                 sources=sources,
+                result_limit=result_limit,
+                min_chars=min_chars,
+                max_chars=max_chars,
                 results=results,
                 errors=errors,
                 report=report,
@@ -6074,6 +7184,59 @@ def application(environ, start_response):
             body = render_sentence_scraper(username, user)
         start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
         return [body.encode("utf-8")]
+
+    if path == "/admin/sentence-scraper/create-cloze" and environ.get("REQUEST_METHOD") == "POST":
+        if not user.get("is_admin"):
+            return redirect(start_response, "/")
+        form = parse_post(environ)
+        ok, text = create_cloze_from_phrase(
+            form.get("phrase", ""),
+            form.get("answer", ""),
+            form.get("translation", ""),
+        )
+        body = render_sentence_scraper(
+            username,
+            user,
+            message=text if ok else "",
+            errors=[] if ok else [text],
+        )
+        start_response("200 OK", [("Content-Type", "text/html; charset=utf-8")])
+        return [body.encode("utf-8")]
+
+    if path == "/admin/sentence-scraper/create-cloze-batch" and environ.get("REQUEST_METHOD") == "POST":
+        if not user.get("is_admin"):
+            start_response("403 Forbidden", [("Content-Type", "application/json; charset=utf-8")])
+            return [json.dumps({"error": "Forbidden"}).encode("utf-8")]
+        form = parse_post(environ)
+        try:
+            items = json.loads(form.get("items", "[]"))
+            if not isinstance(items, list):
+                raise ValueError("Invalid card list.")
+            results = []
+            created = 0
+            for item in items[:SCRAPER_MAX_SENTENCES]:
+                if not isinstance(item, dict):
+                    results.append({"ok": False, "error": "Invalid selected item."})
+                    continue
+                ok, text = create_cloze_from_phrase(
+                    str(item.get("phrase", "")),
+                    str(item.get("answer", "")),
+                    str(item.get("translation", "")),
+                )
+                if ok:
+                    created += 1
+                    results.append({"ok": True})
+                else:
+                    results.append({"ok": False, "error": text})
+            body = {
+                "created": created,
+                "skipped": max(0, len(items[:SCRAPER_MAX_SENTENCES]) - created),
+                "results": results,
+            }
+        except Exception as exc:
+            body = {"error": str(exc)}
+        start_response("200 OK", [("Content-Type", "application/json; charset=utf-8")])
+        return [json.dumps(body, ensure_ascii=False).encode("utf-8")]
 
     if path == "/admin/content":
         if not user.get("is_admin"):
@@ -6088,7 +7251,7 @@ def application(environ, start_response):
         if not user.get("is_admin"):
             return redirect(start_response, "/")
         form = parse_post(environ)
-        ok, text = import_unimorph_verb_tense(
+        ok, text = import_verbecc_verb_tense(
             form.get("infinitive", ""),
             form.get("ja", ""),
             form.get("tense", "presente"),

@@ -1,19 +1,17 @@
 # Third-Party Notices
 
-## UniMorph Italian
+## Verbecc
 
-This project may use Italian morphological data from UniMorph Italian:
+This project uses Verbecc for Italian verb conjugation:
 
-https://github.com/unimorph/ita
+https://github.com/bretttolbert/verbecc
 
-UniMorph Italian lists its source as Wikipedia.
-
-License: Creative Commons Attribution-ShareAlike 3.0
+License: GNU Lesser General Public License v3.0
 
 License text:
 
-https://creativecommons.org/licenses/by-sa/3.0/
+https://www.gnu.org/licenses/lgpl-3.0.html
 
-When UniMorph-derived conjugation data is imported into the application
-database, those rows should be marked with the `unimorph-ita` source metadata
-registered in the `content_sources` table.
+The application uses Verbecc with ML prediction disabled, so conjugation data is
+generated from Verbecc's bundled known-verb tables and templates rather than a
+runtime-trained fallback model.
