@@ -54,16 +54,21 @@ DEFAULT_ELO = 1200
 ELO_K = 32
 NEW_CONTENT_CHANCE = 0.10
 SCRAPER_DEFAULT_SOURCES = [
-    "https://tatoeba.org/en/api_v0/search?query={query}&from=ita",
+    "https://api.tatoeba.org/v1/sentences?lang=ita&q={query}&trans:lang=jpn&trans:is_direct=yes&showtrans=matching&sort=relevance&limit=500",
     "https://it.wikisource.org/wiki/Novelle_per_un_anno",
     "https://it.wikisource.org/wiki/Il_fu_Mattia_Pascal",
     "https://www.galileonet.it/feed/",
     "https://www.doppiozero.com/rss.xml",
     "https://www.iltascabile.com/feed/",
 ]
+SCRAPER_DEFAULT_SOURCES_BY_LANGUAGE = {
+    "it_ja": SCRAPER_DEFAULT_SOURCES,
+    "ja_en": [
+        "https://api.tatoeba.org/v1/sentences?lang=eng&q={query}&trans:lang=jpn&trans:is_direct=yes&showtrans=matching&sort=relevance&limit=500",
+    ],
+}
 SCRAPER_SOURCE_LIBRARY = [
-    ("Tatoeba", "didattico", "https://tatoeba.org/en/api_v0/search?query={query}&from=ita"),
-    ("Tatoeba + Japanese", "didattico/traduzioni", "https://tatoeba.org/en/api_v0/search?query={query}&from=ita&to=jpn"),
+    ("Tatoeba + Japanese", "didattico/traduzioni", "https://api.tatoeba.org/v1/sentences?lang=ita&q={query}&trans:lang=jpn&trans:is_direct=yes&showtrans=matching&sort=relevance&limit=500"),
     ("Wikisource - Novelle per un anno", "storie/libri", "https://it.wikisource.org/wiki/Novelle_per_un_anno"),
     ("Wikisource - Il fu Mattia Pascal", "storie/libri", "https://it.wikisource.org/wiki/Il_fu_Mattia_Pascal"),
     ("Project Gutenberg - Italiano", "libri", "https://www.gutenberg.org/browse/languages/it"),
@@ -79,6 +84,13 @@ SCRAPER_SOURCE_LIBRARY = [
     ("Pagella Politica", "fact checking", "https://pagellapolitica.it/feed"),
     ("ANSA", "notizie brevi", "https://www.ansa.it/sito/ansait_rss.xml"),
 ]
+SCRAPER_SOURCE_LIBRARY_BY_LANGUAGE = {
+    "it_ja": SCRAPER_SOURCE_LIBRARY,
+    "ja_en": [
+        ("Tatoeba English + Japanese", "didattico/traduzioni", "https://api.tatoeba.org/v1/sentences?lang=eng&q={query}&trans:lang=jpn&trans:is_direct=yes&showtrans=matching&sort=relevance&limit=500"),
+        ("Tatoeba English", "didattico", "https://api.tatoeba.org/v1/sentences?lang=eng&q={query}&sort=relevance&limit=500"),
+    ],
+}
 SCRAPER_MAX_SOURCE_LINKS = 4
 SCRAPER_MAX_SENTENCES = 80
 SCRAPER_TIMEOUT_SECONDS = 4
@@ -254,6 +266,14 @@ def study_language(user):
     if language not in STUDY_LANGUAGES:
         return DEFAULT_STUDY_LANGUAGE
     return language
+
+
+def scraper_language(value):
+    return value if value in STUDY_LANGUAGES else study_language({})
+
+
+def set_active_material_key(language):
+    ACTIVE_MATERIAL_DB.set(material_db_path_for_language(scraper_language(language)))
 
 
 def set_active_material_language(user):
@@ -3362,7 +3382,13 @@ def choose_user_card_subset(rows, conn, user, card_type, force_new):
     return seen_rows or rows
 
 
-def weighted_question_row(user, kind):
+def exclude_card_uids(rows, excluded_uids):
+    if not excluded_uids:
+        return list(rows)
+    return [row for row in rows if row["uid"] not in excluded_uids]
+
+
+def weighted_question_row(user, kind, excluded_uids=None):
     init_db()
     user_elo = int(user.get("elo", DEFAULT_ELO))
     with get_db() as conn:
@@ -3397,6 +3423,7 @@ def weighted_question_row(user, kind):
                         AND q.status = 'approved'
                     """
                 ).fetchall()
+            rows = exclude_card_uids(rows, excluded_uids)
             rows = choose_user_card_subset(rows, conn, user, "flashcard", force_new)
         else:
             force_new = random.random() < NEW_CONTENT_CHANCE
@@ -3417,12 +3444,13 @@ def weighted_question_row(user, kind):
                     AND q.status = 'approved'
                 """
             ).fetchall()
+            rows = exclude_card_uids(rows, excluded_uids)
             rows = choose_user_card_subset(rows, conn, user, "verb_form", force_new)
 
     return weighted_row_by_elo(rows, user_elo)
 
 
-def pick_cloze_question(user):
+def pick_cloze_question(user, excluded_uids=None):
     init_db()
     force_new = (
         random.random() < NEW_CONTENT_CHANCE
@@ -3437,6 +3465,7 @@ def pick_cloze_question(user):
                 AND status = 'approved'
             """,
         ).fetchall()
+        rows = exclude_card_uids(rows, excluded_uids)
         rows = choose_user_card_subset(rows, conn, user, "cloze", force_new)
     row = weighted_row_by_elo(rows, int(user.get("elo", DEFAULT_ELO)))
     if not row:
@@ -3453,8 +3482,12 @@ def pick_cloze_question(user):
     }
 
 
-def pick_question(user=None):
-    row = weighted_question_row(user or {"name": "", "elo": DEFAULT_ELO}, "verb_form")
+def pick_question(user=None, excluded_uids=None, allow_fallback=True):
+    row = weighted_question_row(
+        user or {"name": "", "elo": DEFAULT_ELO},
+        "verb_form",
+        excluded_uids=excluded_uids,
+    )
     if row:
         return {
             "question_id": row["id"],
@@ -3469,6 +3502,8 @@ def pick_question(user=None):
             "answer": row["answer"],
             "gender": row["gender"],
         }
+    if not allow_fallback:
+        return None
     verb = random.choice(VERBS)
     form = random.choice(verb["forms"])
     return {
@@ -3512,8 +3547,8 @@ def user_flashcard_pool(user):
     ]
 
 
-def pick_flashcard(user):
-    row = weighted_question_row(user, "flashcard")
+def pick_flashcard(user, excluded_uids=None, allow_fallback=True):
+    row = weighted_question_row(user, "flashcard", excluded_uids=excluded_uids)
     if row:
         card = {
             "question_id": row["id"],
@@ -3525,7 +3560,11 @@ def pick_flashcard(user):
             "translation": row["answer"],
         }
     else:
+        if not allow_fallback:
+            return None, []
         cards = user_flashcard_pool(user)
+        if not cards:
+            return None, []
         card = random.choice(cards)
         card["question_id"] = ""
         card["question_elo"] = DEFAULT_ELO
@@ -3574,6 +3613,12 @@ def distribute_daily_counts(total):
     }
 
 
+def remember_daily_card(used_uids, item):
+    uid = item.get("card_uid")
+    if uid:
+        used_uids.add(uid)
+
+
 def build_daily_state(user, target=None):
     total = max(1, min(100, int(target or user.get("daily_target", DEFAULT_DAILY_TARGET))))
     if STUDY_LANGUAGES[study_language(user)].get("verb_enabled"):
@@ -3581,58 +3626,69 @@ def build_daily_state(user, target=None):
     else:
         counts = {"verb_form": 0, "flashcard": 0, "cloze": total}
     items = []
+    used_uids = set()
 
     for _ in range(counts["verb_form"]):
-        question = pick_question(user)
+        question = pick_question(user, excluded_uids=used_uids, allow_fallback=False)
+        if not question:
+            continue
+        item = {
+            "game": "verb_form",
+            "question_id": question.get("question_id", ""),
+            "card_uid": question.get("card_uid", ""),
+            "card_revision": int(question.get("card_revision", 1)),
+            "question_elo": int(question.get("question_elo", DEFAULT_ELO)),
+            "is_new": bool(question.get("is_new")),
+            "infinitive": question["infinitive"],
+            "ja": question["ja"],
+            "tense": question["tense"],
+            "pronoun": question["pronoun"],
+            "gender": question.get("gender", ""),
+            "answer": question["answer"],
+        }
+        remember_daily_card(used_uids, item)
         items.append(
-            {
-                "game": "verb_form",
-                "question_id": question.get("question_id", ""),
-                "card_uid": question.get("card_uid", ""),
-                "card_revision": int(question.get("card_revision", 1)),
-                "question_elo": int(question.get("question_elo", DEFAULT_ELO)),
-                "is_new": bool(question.get("is_new")),
-                "infinitive": question["infinitive"],
-                "ja": question["ja"],
-                "tense": question["tense"],
-                "pronoun": question["pronoun"],
-                "gender": question.get("gender", ""),
-                "answer": question["answer"],
-            }
+            item
         )
 
     for _ in range(counts["flashcard"]):
-        card, options = pick_flashcard(user)
+        card, options = pick_flashcard(user, excluded_uids=used_uids, allow_fallback=False)
+        if not card:
+            continue
+        item = {
+            "game": "flashcard",
+            "question_id": card.get("question_id", ""),
+            "card_uid": card.get("card_uid", ""),
+            "card_revision": int(card.get("card_revision", 1)),
+            "question_elo": int(card.get("question_elo", DEFAULT_ELO)),
+            "is_new": bool(card.get("is_new")),
+            "word": card["word"],
+            "translation": card["translation"],
+            "options": options,
+        }
+        remember_daily_card(used_uids, item)
         items.append(
-            {
-                "game": "flashcard",
-                "question_id": card.get("question_id", ""),
-                "card_uid": card.get("card_uid", ""),
-                "card_revision": int(card.get("card_revision", 1)),
-                "question_elo": int(card.get("question_elo", DEFAULT_ELO)),
-                "is_new": bool(card.get("is_new")),
-                "word": card["word"],
-                "translation": card["translation"],
-                "options": options,
-            }
+            item
         )
 
     for _ in range(counts["cloze"]):
-        question = pick_cloze_question(user)
+        question = pick_cloze_question(user, excluded_uids=used_uids)
         if not question:
             continue
+        item = {
+            "game": "cloze",
+            "question_id": question.get("question_id", ""),
+            "card_uid": question.get("card_uid", ""),
+            "card_revision": int(question.get("card_revision", 1)),
+            "question_elo": int(question.get("question_elo", DEFAULT_ELO)),
+            "is_new": bool(question.get("is_new")),
+            "sentence": question["sentence"],
+            "answer": question["answer"],
+            "translation": question["translation"],
+        }
+        remember_daily_card(used_uids, item)
         items.append(
-            {
-                "game": "cloze",
-                "question_id": question.get("question_id", ""),
-                "card_uid": question.get("card_uid", ""),
-                "card_revision": int(question.get("card_revision", 1)),
-                "question_elo": int(question.get("question_elo", DEFAULT_ELO)),
-                "is_new": bool(question.get("is_new")),
-                "sentence": question["sentence"],
-                "answer": question["answer"],
-                "translation": question["translation"],
-            }
+            item
         )
 
     random.shuffle(items)
@@ -5766,7 +5822,7 @@ def sentence_candidates(text, min_chars=0, max_chars=320):
 
 def content_sentence_items(raw, url, min_chars=0, max_chars=320):
     stripped = raw.lstrip()
-    if "tatoeba.org/" in url and stripped.startswith("{"):
+    if is_tatoeba_api_url(url) and stripped.startswith("{"):
         try:
             data = json.loads(stripped)
         except json.JSONDecodeError:
@@ -5775,12 +5831,17 @@ def content_sentence_items(raw, url, min_chars=0, max_chars=320):
                 for sentence in sentence_candidates(html_to_text(raw), min_chars=min_chars, max_chars=max_chars)
             ]
         items = []
-        for row in data.get("results", []):
+        for row in data.get("data", []):
             text = str(row.get("text", "")).strip()
             if min_chars <= len(text) <= max_chars:
                 translations = []
-                for group in row.get("translations", []):
-                    for translation in group:
+                raw_translations = row.get("translations", [])
+                if raw_translations and isinstance(raw_translations[0], list):
+                    translation_groups = raw_translations
+                else:
+                    translation_groups = [raw_translations]
+                for group in translation_groups:
+                    for translation in group or []:
                         if translation.get("lang") == "jpn" and translation.get("text"):
                             translations.append(str(translation["text"]).strip())
                 items.append(
@@ -5794,6 +5855,32 @@ def content_sentence_items(raw, url, min_chars=0, max_chars=320):
         {"sentence": sentence, "translation": ""}
         for sentence in sentence_candidates(html_to_text(raw), min_chars=min_chars, max_chars=max_chars)
     ]
+
+
+def is_tatoeba_api_url(url):
+    return "api.tatoeba.org/" in url and "/v1/sentences" in url
+
+
+def tatoeba_next_url(raw):
+    if not raw.lstrip().startswith("{"):
+        return ""
+    try:
+        data = json.loads(raw.lstrip())
+    except json.JSONDecodeError:
+        return ""
+    paging = data.get("paging", {}) or {}
+    return paging.get("next") or ""
+
+
+def content_sentence_count(raw, url):
+    stripped = raw.lstrip()
+    if is_tatoeba_api_url(url) and stripped.startswith("{"):
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError:
+            return len(sentence_candidates(html_to_text(raw), min_chars=0, max_chars=1000))
+        return len(data.get("data", []))
+    return len(sentence_candidates(html_to_text(raw), min_chars=0, max_chars=1000))
 
 
 def normalized_span_match(text, terms):
@@ -5869,6 +5956,15 @@ def verbecc_search_terms(infinitive, tense):
     return terms
 
 
+def scraper_search_terms(word, tense, language):
+    if scraper_language(language) == "it_ja" and tense:
+        return verbecc_search_terms(word, tense)
+    word = word.strip()
+    if not word:
+        raise ValueError("Search word is required.")
+    return [word]
+
+
 def expand_source_urls(source_lines, word, search_terms):
     urls = []
     seen = set()
@@ -5920,6 +6016,8 @@ def iter_scrape_events(search_terms, source_urls, result_limit=80, min_chars=0, 
         "max_chars": max_chars,
         "visited": 0,
         "links_found": 0,
+        "sentences_seen": 0,
+        "filtered_by_length": 0,
         "sentences_checked": 0,
         "matches": 0,
         "per_url": {},
@@ -5928,13 +6026,40 @@ def iter_scrape_events(search_terms, source_urls, result_limit=80, min_chars=0, 
     results_count = 0
     opener = build_opener(HTTPCookieProcessor(CookieJar()))
 
+    def process_raw_url(url, raw):
+        nonlocal results_count
+        before_matches = results_count
+        events = []
+        candidate_count = content_sentence_count(raw, url)
+        filtered_items = content_sentence_items(raw, url, min_chars=min_chars, max_chars=max_chars)
+        report["sentences_seen"] += candidate_count
+        report["filtered_by_length"] += max(0, candidate_count - len(filtered_items))
+        for item_data in filtered_items:
+            sentence = item_data["sentence"]
+            report["sentences_checked"] += 1
+            if word_pattern and word_pattern.search(normalize_match_text(sentence)):
+                results_count += 1
+                target = normalized_span_match(sentence, search_terms)
+                item = {
+                    "sentence": sentence + ".",
+                    "source": url,
+                    "target": target,
+                    "translation": item_data.get("translation", ""),
+                }
+                events.append({"type": "result", "item": item})
+                if results_count >= result_limit:
+                    break
+        found_here = results_count - before_matches
+        if found_here:
+            report["per_url"][url] = found_here
+        return events
+
     def scan_url(url, follow_links=False):
         nonlocal results_count
         if url in visited or results_count >= result_limit:
             return []
         visited.add(url)
         report["visited"] += 1
-        before_matches = results_count
         events = [{"type": "status", "message": f"Checking {url}"}]
         try:
             raw = fetch_url_text(url, opener=opener)
@@ -5964,26 +6089,10 @@ def iter_scrape_events(search_terms, source_urls, result_limit=80, min_chars=0, 
             message = f"{url}: {exc}"
             events.append({"type": "error", "message": message})
             return events
-        for item_data in content_sentence_items(raw, url, min_chars=min_chars, max_chars=max_chars):
-            sentence = item_data["sentence"]
-            report["sentences_checked"] += 1
-            if word_pattern and word_pattern.search(normalize_match_text(sentence)):
-                results_count += 1
-                target = normalized_span_match(sentence, search_terms)
-                item = {
-                    "sentence": sentence + ".",
-                    "source": url,
-                    "target": target,
-                    "translation": item_data.get("translation", ""),
-                }
-                events.append({"type": "result", "item": item})
-                if results_count >= result_limit:
-                    report["matches"] = results_count
-                    report["per_url"][url] = results_count - before_matches
-                    return events
-        found_here = results_count - before_matches
-        if found_here:
-            report["per_url"][url] = found_here
+        events.extend(process_raw_url(url, raw))
+        if results_count >= result_limit:
+            report["matches"] = results_count
+            return events
         if follow_links:
             links = extract_links(raw, url)
             report["links_found"] += len(links)
@@ -5995,9 +6104,37 @@ def iter_scrape_events(search_terms, source_urls, result_limit=80, min_chars=0, 
                     return events
         return events
 
+    def scan_tatoeba_source(url):
+        nonlocal results_count
+        next_url = url
+        page = 1
+        while next_url and results_count < result_limit:
+            if next_url in visited:
+                return
+            visited.add(next_url)
+            report["visited"] += 1
+            yield {"type": "status", "message": f"Checking Tatoeba page {page}: {next_url}"}
+            try:
+                raw = fetch_url_text(next_url)
+            except HTTPError as exc:
+                yield {"type": "error", "message": f"{next_url}: HTTP {exc.code}"}
+                return
+            except Exception as exc:
+                yield {"type": "error", "message": f"{next_url}: {exc}"}
+                return
+            for event in process_raw_url(next_url, raw):
+                yield event
+            if results_count >= result_limit:
+                return
+            next_url = tatoeba_next_url(raw)
+            page += 1
+
     for source_url in source_urls:
-        for event in scan_url(source_url, follow_links=True):
-            yield event
+        if is_tatoeba_api_url(source_url):
+            yield from scan_tatoeba_source(source_url)
+        else:
+            for event in scan_url(source_url, follow_links=True):
+                yield event
         if results_count >= result_limit:
             break
     report["matches"] = results_count
@@ -6065,7 +6202,7 @@ def extract_response_text(data):
     return "\n".join(chunks).strip()
 
 
-def translate_sentences_with_openai(sentences, api_key=""):
+def translate_sentences_with_openai(sentences, api_key="", material_language=DEFAULT_STUDY_LANGUAGE):
     api_key = (api_key or os.environ.get("OPENAI_API_KEY", "")).strip()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set.")
@@ -6073,8 +6210,9 @@ def translate_sentences_with_openai(sentences, api_key=""):
     if not clean_sentences:
         return []
     model = os.environ.get("OPENAI_TRANSLATION_MODEL", "gpt-4.1-mini")
+    source_name = "English" if scraper_language(material_language) == "ja_en" else "Italian"
     prompt = (
-        "Translate these Italian sentences into natural Japanese. "
+        f"Translate these {source_name} sentences into natural Japanese. "
         "Return only a JSON object with key \"translations\", whose value is an array of strings in the same order.\n\n"
         + json.dumps(clean_sentences, ensure_ascii=False)
     )
@@ -6129,6 +6267,7 @@ def highlight_sentence_html(sentence, target):
 def render_sentence_scraper(
     username,
     user,
+    material_language=None,
     word="",
     tense="",
     sources="",
@@ -6141,7 +6280,10 @@ def render_sentence_scraper(
     message="",
 ):
     nav_html = render_nav(username, user, "管理")
-    default_sources = "\n".join(SCRAPER_DEFAULT_SOURCES)
+    material_language = scraper_language(material_language or study_language(user))
+    default_source_list = SCRAPER_DEFAULT_SOURCES_BY_LANGUAGE.get(material_language, SCRAPER_DEFAULT_SOURCES)
+    source_library = SCRAPER_SOURCE_LIBRARY_BY_LANGUAGE.get(material_language, SCRAPER_SOURCE_LIBRARY)
+    default_sources = "\n".join(default_source_list)
     sources_value = sources if sources else default_sources
     results = results or []
     errors = errors or []
@@ -6151,6 +6293,10 @@ def render_sentence_scraper(
     search_tense_options += "".join(
         f'<option value="{escape(key)}" {"selected" if key == tense else ""}>{escape(info["label"])}</option>'
         for key, info in SUPPORTED_TENSES.items()
+    )
+    language_options = "".join(
+        f'<option value="{escape(key)}" {"selected" if key == material_language else ""}>{escape(info["label"])}</option>'
+        for key, info in STUDY_LANGUAGES.items()
     )
     result_html = (
         "".join(
@@ -6195,6 +6341,8 @@ def render_sentence_scraper(
           {terms_html}
           <div>確認したURL: {int(report.get("visited", 0))}</div>
           <div>見つけた記事リンク: {int(report.get("links_found", 0))}</div>
+          <div>取得した文: {int(report.get("sentences_seen", 0))}</div>
+          <div>文字数で除外: {int(report.get("filtered_by_length", 0))}</div>
           <div>確認した文候補: {int(report.get("sentences_checked", 0))}</div>
           <div>一致した例文: {int(report.get("matches", 0))}</div>
           <ul>{per_url_html}</ul>
@@ -6205,9 +6353,26 @@ def render_sentence_scraper(
         f'<input type="checkbox" value="{escape(url)}" />'
         f'<span><strong>{escape(name)}</strong><em>{escape(kind)}</em><code>{escape(url)}</code></span>'
         "</label>"
-        for name, kind, url in SCRAPER_SOURCE_LIBRARY
+        for name, kind, url in source_library
     )
-    all_source_urls = "\n".join(url for _, _, url in SCRAPER_SOURCE_LIBRARY)
+    all_source_urls = "\n".join(url for _, _, url in source_library)
+    sources_by_language_json = json.dumps(
+        {
+            key: "\n".join(value)
+            for key, value in SCRAPER_DEFAULT_SOURCES_BY_LANGUAGE.items()
+        },
+        ensure_ascii=False,
+    )
+    source_library_by_language_json = json.dumps(
+        {
+            key: [
+                {"name": name, "kind": kind, "url": url}
+                for name, kind, url in value
+            ]
+            for key, value in SCRAPER_SOURCE_LIBRARY_BY_LANGUAGE.items()
+        },
+        ensure_ascii=False,
+    )
     return f"""<!doctype html>
 <html lang="ja">
   <head>
@@ -6274,7 +6439,7 @@ def render_sentence_scraper(
       .search-grid {{
         display: grid;
         gap: 12px;
-        grid-template-columns: minmax(0, 1fr) 170px 120px 120px 120px;
+        grid-template-columns: minmax(0, 1fr) 170px 170px 120px 120px 120px;
       }}
       textarea {{
         min-height: 120px;
@@ -6509,7 +6674,15 @@ def render_sentence_scraper(
         }});
       }}
       var scrapeController = null;
-      var sourceStorageKey = "verbiScraperSourcesV3";
+      var scraperDefaultSources = {sources_by_language_json};
+      var scraperSourceLibrary = {source_library_by_language_json};
+      function scraperLanguage() {{
+        var input = document.querySelector("select[name='material_language']");
+        return input ? input.value : "{escape(material_language)}";
+      }}
+      function sourceStorageKey() {{
+        return "verbiScraperSourcesV4:" + scraperLanguage();
+      }}
       function highlightTarget(sentence, target) {{
         if (!target) {{
           return escapeHtml(sentence);
@@ -6581,6 +6754,8 @@ def render_sentence_scraper(
           (terms ? '<div class="terms-preview">' + escapeHtml(terms) + '</div>' : '') +
           '<div>確認したURL: ' + Number(report.visited || 0) + '</div>' +
           '<div>見つけた記事リンク: ' + Number(report.links_found || 0) + '</div>' +
+          '<div>取得した文: ' + Number(report.sentences_seen || 0) + '</div>' +
+          '<div>文字数で除外: ' + Number(report.filtered_by_length || 0) + '</div>' +
           '<div>確認した文候補: ' + Number(report.sentences_checked || 0) + '</div>' +
           '<div>一致した例文: ' + Number(report.matches || 0) + '</div>' +
           '<ul>' + perUrl + '</ul>' +
@@ -6684,7 +6859,7 @@ def render_sentence_scraper(
         var apiKey = apiKeyInput ? apiKeyInput.value : "";
         fetch("/admin/sentence-scraper/translate", {{
           method: "POST",
-          body: new URLSearchParams({{items: JSON.stringify(sentences), api_key: apiKey}})
+          body: new URLSearchParams({{items: JSON.stringify(sentences), api_key: apiKey, material_language: scraperLanguage()}})
         }}).then(function(response) {{
           return response.json();
         }}).then(function(data) {{
@@ -6728,7 +6903,7 @@ def render_sentence_scraper(
         setScrapeStatus("Creating selected cards...");
         fetch("/admin/sentence-scraper/create-cloze-batch", {{
           method: "POST",
-          body: new URLSearchParams({{items: JSON.stringify(cards)}})
+          body: new URLSearchParams({{items: JSON.stringify(cards), material_language: scraperLanguage()}})
         }}).then(function(response) {{
           return response.json();
         }}).then(function(data) {{
@@ -6801,6 +6976,25 @@ def render_sentence_scraper(
         var urls = document.getElementById("all-source-urls").value.split(/\\r?\\n/);
         addSources(urls);
       }}
+      function renderSourceChoices() {{
+        var list = document.querySelector("#source-modal .source-picker-list");
+        if (!list) {{
+          return;
+        }}
+        var sources = scraperSourceLibrary[scraperLanguage()] || [];
+        list.innerHTML = sources.map(function(source) {{
+          return '<label class="source-choice">' +
+            '<input type="checkbox" value="' + escapeHtml(source.url || "") + '" />' +
+            '<span><strong>' + escapeHtml(source.name || "") + '</strong>' +
+            '<em>' + escapeHtml(source.kind || "") + '</em>' +
+            '<code>' + escapeHtml(source.url || "") + '</code></span>' +
+            '</label>';
+        }}).join("");
+        var allUrls = document.getElementById("all-source-urls");
+        if (allUrls) {{
+          allUrls.value = sources.map(function(source) {{ return source.url || ""; }}).join("\\n");
+        }}
+      }}
       function sourceTextarea() {{
         return document.querySelector("textarea[name='sources']");
       }}
@@ -6835,7 +7029,7 @@ def render_sentence_scraper(
         var textarea = sourceTextarea();
         if (textarea) {{
           textarea.value = urls.join("\\n");
-          localStorage.setItem(sourceStorageKey, textarea.value);
+          localStorage.setItem(sourceStorageKey(), textarea.value);
         }}
         updateSourceSummary();
         closeSourceModal();
@@ -6850,16 +7044,37 @@ def render_sentence_scraper(
         var defaults = document.getElementById("default-source-urls");
         if (textarea && defaults) {{
           textarea.value = defaults.value;
-          localStorage.setItem(sourceStorageKey, textarea.value);
+          localStorage.setItem(sourceStorageKey(), textarea.value);
         }}
         updateSourceSummary();
         closeSourceModal();
       }}
       function restoreSavedSources() {{
-        var saved = localStorage.getItem(sourceStorageKey);
+        var saved = localStorage.getItem(sourceStorageKey());
         var textarea = sourceTextarea();
         if (saved && textarea) {{
           textarea.value = saved;
+        }}
+        updateSourceSummary();
+      }}
+      function changeScraperLanguage() {{
+        renderSourceChoices();
+        var textarea = sourceTextarea();
+        if (textarea) {{
+          var saved = localStorage.getItem(sourceStorageKey());
+          textarea.value = saved || scraperDefaultSources[scraperLanguage()] || "";
+        }}
+        var tense = document.querySelector("select[name='tense']");
+        if (tense) {{
+          var italian = scraperLanguage() === "it_ja";
+          tense.disabled = !italian;
+          if (!italian) {{
+            tense.value = "";
+          }}
+        }}
+        var hiddenLanguage = document.querySelector("#cloze-modal input[name='material_language']");
+        if (hiddenLanguage) {{
+          hiddenLanguage.value = scraperLanguage();
         }}
         updateSourceSummary();
       }}
@@ -6867,6 +7082,10 @@ def render_sentence_scraper(
         var sentence = button.getAttribute("data-sentence") || "";
         var target = button.getAttribute("data-target") || "";
         var translation = button.getAttribute("data-translation") || "";
+        var hiddenLanguage = document.querySelector("#cloze-modal input[name='material_language']");
+        if (hiddenLanguage) {{
+          hiddenLanguage.value = scraperLanguage();
+        }}
         document.getElementById("cloze-phrase").value = sentence;
         document.getElementById("cloze-answer").value = target;
         document.getElementById("cloze-translation").value = translation;
@@ -6887,7 +7106,10 @@ def render_sentence_scraper(
           answer.value = selected;
         }}
       }}
-      document.addEventListener("DOMContentLoaded", restoreSavedSources);
+      document.addEventListener("DOMContentLoaded", function() {{
+        restoreSavedSources();
+        changeScraperLanguage();
+      }});
     </script>
   </head>
   <body>
@@ -6901,6 +7123,10 @@ def render_sentence_scraper(
             <div>
               <label>検索する語 / 動詞</label>
               <input name="word" value="{escape(word)}" placeholder="andare" required />
+            </div>
+            <div>
+              <label>教材</label>
+              <select name="material_language" onchange="changeScraperLanguage()">{language_options}</select>
             </div>
             <div>
               <label>時制</label>
@@ -6952,6 +7178,7 @@ def render_sentence_scraper(
       <div id="cloze-modal" class="modal-backdrop">
         <form class="modal" method="post" action="/admin/sentence-scraper/create-cloze">
           <h2>クローズカード作成</h2>
+          <input type="hidden" name="material_language" value="{escape(material_language)}" />
           <label>カードに使う文の範囲</label>
           <textarea id="cloze-phrase" name="phrase" required></textarea>
           <label>穴埋めにする部分</label>
@@ -7179,6 +7406,7 @@ def application(environ, start_response):
         form = parse_post(environ)
         word = form.get("word", "").strip()
         tense = form.get("tense", "").strip()
+        material_language = scraper_language(form.get("material_language", ""))
         try:
             result_limit = int(form.get("result_limit", "20"))
         except ValueError:
@@ -7193,7 +7421,8 @@ def application(environ, start_response):
             max_chars = 180
         def stream():
             try:
-                search_terms = verbecc_search_terms(word, tense) if tense else [word]
+                set_active_material_key(material_language)
+                search_terms = scraper_search_terms(word, tense, material_language)
                 source_urls = expand_source_urls(
                     form.get("sources", "").splitlines(),
                     word,
@@ -7217,6 +7446,8 @@ def application(environ, start_response):
                     "max_chars": max_chars,
                     "visited": 0,
                     "links_found": 0,
+                    "sentences_seen": 0,
+                    "filtered_by_length": 0,
                     "sentences_checked": 0,
                     "matches": 0,
                     "per_url": {},
@@ -7241,7 +7472,11 @@ def application(environ, start_response):
         form = parse_post(environ)
         try:
             sentences = json.loads(form.get("items", "[]"))
-            translations = translate_sentences_with_openai(sentences, form.get("api_key", ""))
+            translations = translate_sentences_with_openai(
+                sentences,
+                form.get("api_key", ""),
+                form.get("material_language", ""),
+            )
             body = {"translations": translations}
         except Exception as exc:
             body = {"error": str(exc)}
@@ -7255,6 +7490,7 @@ def application(environ, start_response):
             form = parse_post(environ)
             word = form.get("word", "").strip()
             tense = form.get("tense", "").strip()
+            material_language = scraper_language(form.get("material_language", ""))
             try:
                 result_limit = int(form.get("result_limit", "20"))
             except ValueError:
@@ -7269,7 +7505,8 @@ def application(environ, start_response):
                 max_chars = 180
             sources = form.get("sources", "")
             try:
-                search_terms = verbecc_search_terms(word, tense) if tense else [word]
+                set_active_material_key(material_language)
+                search_terms = scraper_search_terms(word, tense, material_language)
                 source_urls = expand_source_urls(sources.splitlines(), word, search_terms)
                 results, errors, report = scrape_example_sentences(
                     search_terms,
@@ -7289,6 +7526,7 @@ def application(environ, start_response):
             body = render_sentence_scraper(
                 username,
                 user,
+                material_language=material_language,
                 word=word,
                 tense=tense,
                 sources=sources,
@@ -7308,6 +7546,8 @@ def application(environ, start_response):
         if not user.get("is_admin"):
             return redirect(start_response, "/")
         form = parse_post(environ)
+        material_language = scraper_language(form.get("material_language", ""))
+        set_active_material_key(material_language)
         ok, text = create_cloze_from_phrase(
             form.get("phrase", ""),
             form.get("answer", ""),
@@ -7316,6 +7556,7 @@ def application(environ, start_response):
         body = render_sentence_scraper(
             username,
             user,
+            material_language=material_language,
             message=text if ok else "",
             errors=[] if ok else [text],
         )
@@ -7328,6 +7569,8 @@ def application(environ, start_response):
             return [json.dumps({"error": "Forbidden"}).encode("utf-8")]
         form = parse_post(environ)
         try:
+            material_language = scraper_language(form.get("material_language", ""))
+            set_active_material_key(material_language)
             items = json.loads(form.get("items", "[]"))
             if not isinstance(items, list):
                 raise ValueError("Invalid card list.")
